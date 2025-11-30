@@ -6,21 +6,16 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Логируем все запросы
-app.use((req, res, next) => {
-  console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`, req.body || "");
-  next();
-});
-
-// Маршруты Tinkoff
-app.use("/api", tinkoffRouter);
-
-// Health check
+// === Health-check ===
 app.get("/health", (req, res) => {
+  console.log("💚 Health check ping");
   res.json({ status: "ok", timestamp: Date.now() });
 });
 
+// === Tinkoff API routes ===
+app.use("/api", tinkoffRouter);
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log("Server running on port", PORT);
+  console.log(`🚀 Server running on port ${PORT}`);
 });
