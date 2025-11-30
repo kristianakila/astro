@@ -1,98 +1,116 @@
 import express from "express";
-import admin from "firebase-admin";
-import fetch from "node-fetch";
 import crypto from "crypto";
-import iconv from 'iconv-lite'
+import fetch from "node-fetch";
+import iconv from "iconv-lite";
 import { parseStringPromise } from "xml2js";
+import { db } from "../index.js"; // <<< Firestore теперь отсюда
+import admin from "firebase-admin";
+
+const router = express.Router();
 
 // === Константы Tinkoff ===
 const TINKOFF_TERMINAL_KEY = "1691507148627";
 const TINKOFF_PASSWORD = "rlkzhollw74x8uvv";
 const TINKOFF_API_URL = "https://securepay.tinkoff.ru/v2";
 
-// === Firebase ===
-if (!admin.apps.length) {
-  admin.initializeApp({
-    credential: admin.credential.applicationDefault(),
-  });
-}
-
-const db = admin.firestore();
-
 // === Генерация токена Init ===
 function generateTinkoffTokenInit({ Amount, CustomerKey, Description, OrderId }) {
-  const tokenString = `${Amount}${CustomerKey}${Description}${OrderId}${TINKOFF_PASSWORD}${TINKOFF_TERMINAL_KEY}`;
-  return crypto.createHash("sha256").update(tokenString, "utf8").digest("hex");
+  const raw = `${Amount}${CustomerKey}${Description}${OrderId}${TINKOFF_PASSWORD}${TINKOFF_TERMINAL_KEY}`;
+  console.log("🔐 Token Init RAW:", raw);
+  return crypto.createHash("sha256").update(raw, "utf8").digest("hex");
 }
 
-// === Генерация токена FinishAuthorize ===
+// === Генерация токена Finish ===
 function generateTinkoffTokenFinish({ Amount, CustomerKey, Description, OrderId, PaymentId }) {
-  const tokenString = `${Amount}${CustomerKey}${Description}${OrderId}${PaymentId || ""}${TINKOFF_PASSWORD}${TINKOFF_TERMINAL_KEY}`;
-  return crypto.createHash("sha256").update(tokenString, "utf8").digest("hex");
+  const raw = `${Amount}${CustomerKey}${Description}${OrderId}${PaymentId}${TINKOFF_PASSWORD}${TINKOFF_TERMINAL_KEY}`;
+  console.log("🔐 Token Finish RAW:", raw);
+  return crypto.createHash("sha256").update(raw, "utf8").digest("hex");
 }
 
 // === POST к Tinkoff API ===
 async function postTinkoff(method, payload) {
+  console.log(`📤 Tinkoff request: ${method}`, payload);
+
   const resp = await fetch(`${TINKOFF_API_URL}/${method}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   });
-  return await resp.json();
-}
 
-const router = express.Router();
+  const data = await resp.json();
+  console.log(`📥 Tinkoff response (${method}):`, data);
+
+  return data;
+}
 
 // === Курс USD → RUB ===
 async function getUsdToRubRate() {
   try {
     const today = new Date();
-    const dd = String(today.getDate()).padStart(2, '0');
-    const mm = String(today.getMonth() + 1).padStart(2, '0');
+    const dd = String(today.getDate()).padStart(2, "0");
+    const mm = String(today.getMonth() + 1).padStart(2, "0");
     const yyyy = today.getFullYear();
     const dateStr = `${dd}/${mm}/${yyyy}`;
 
     const cbUrl = `https://www.cbr.ru/scripts/XML_daily.asp?date_req=${dateStr}`;
+    console.log("📡 Fetching CBR:", cbUrl);
+
     const resp = await fetch(cbUrl);
-    if (!resp.ok) throw new Error('CBR fetch failed');
+    if (!resp.ok) throw new Error("CBR fetch failed");
 
     const buffer = await resp.arrayBuffer();
-    const text = iconv.decode(Buffer.from(buffer), 'win1251');
+    const text = iconv.decode(Buffer.from(buffer), "win1251");
 
-    const regex = /<Valute\s+ID="[^"]*">[\s\S]*?<CharCode>USD<\/CharCode>[\s\S]*?<Nominal>(\d+)<\/Nominal>[\s\S]*?<Value>([\d,]+)<\/Value>[\s\S]*?<\/Valute>/i;
-    const match = text.match(regex);
-    if (!match) throw new Error('USD rate not found in CBR XML');
+    const match = text.match(
+      /<Valute\s+ID="[^"]*">[\s\S]*?<CharCode>USD<\/CharCode>[\s\S]*?<Nominal>(\d+)<\/Nominal>[\s\S]*?<Value>([\d,]+)<\/Value>[\s\S]*?<\/Valute>/i
+    );
+
+    if (!match) throw new Error("USD not found in XML");
 
     const nominal = parseInt(match[1], 10);
-    const value = parseFloat(match[2].replace(',', '.'));
-    return value / nominal;
+    const value = parseFloat(match[2].replace(",", "."));
+    const rate = value / nominal;
 
+    console.log("💱 CBR USD/RUB:", rate);
+    return rate;
   } catch (err) {
-    console.warn('Failed to fetch USD rate from CBR, fallback to Firebase:', err.message);
-    const ratesDoc = await db.collection("settings").doc("exchangeRates").get();
-    const ratesData = ratesDoc.exists ? ratesDoc.data() : { USD_RUB: 100 };
-    return ratesData.USD_RUB;
+    console.warn("⚠️ CBR error, fallback:", err.message);
+
+    const doc = await db.collection("settings").doc("exchangeRates").get();
+    const val = doc.exists ? doc.data().USD_RUB : 100;
+
+    console.log("💱 Using fallback USD/RUB:", val);
+    return val;
   }
 }
 
 // === Init ===
 router.post("/init", async (req, res) => {
+  console.log("➡️ /api/init BODY:", req.body);
+
   try {
     const { amount, currency = "RUB", userId, orderId, description } = req.body;
-    if (!amount || !userId || !description)
-      return res.status(400).json({ error: "Missing amount, userId or description" });
 
-    let usdToRub = 1;
-    if (currency === "USD") usdToRub = await getUsdToRubRate();
+    if (!amount || !userId || !description) {
+      console.log("❌ Missing params");
+      return res.status(400).json({ error: "Missing amount, userId, description" });
+    }
 
-    let amountInRub = Number(amount);
-    if (currency === "USD") amountInRub = amountInRub * usdToRub;
+    // === Конвертация при USD ===
+    let rate = 1;
+    if (currency === "USD") rate = await getUsdToRubRate();
 
-    const amountInKopecks = Math.round(amountInRub * 100);
-    const finalOrderId = (orderId || `ORD${Date.now()}${Math.floor(Math.random() * 10000)}`).slice(0, 36);
+    const amountRub = currency === "USD" ? amount * rate : amount;
+    const amountKop = Math.round(amountRub * 100);
+
+    const finalOrderId =
+      (orderId || `ORD-${Date.now()}-${Math.floor(Math.random() * 9000 + 1000)}`).slice(0, 36);
+
+    console.log("🧾 Amount RUB:", amountRub, "Kopecks:", amountKop);
+    console.log("🧾 OrderId:", finalOrderId);
 
     const token = generateTinkoffTokenInit({
-      Amount: amountInKopecks,
+      Amount: amountKop,
       CustomerKey: userId,
       Description: description,
       OrderId: finalOrderId,
@@ -100,10 +118,10 @@ router.post("/init", async (req, res) => {
 
     const payload = {
       TerminalKey: TINKOFF_TERMINAL_KEY,
-      Amount: amountInKopecks,
+      Amount: amountKop,
       OrderId: finalOrderId,
-      CustomerKey: userId,
       Description: description,
+      CustomerKey: userId,
       Token: token,
       Receipt: {
         Email: "test@example.com",
@@ -111,50 +129,66 @@ router.post("/init", async (req, res) => {
         Items: [
           {
             Name: description,
-            Price: amountInKopecks,
-            Quantity: 1.0,
-            Amount: amountInKopecks,
-            Tax: "none"
-          }
-        ]
-      }
+            Price: amountKop,
+            Quantity: 1,
+            Amount: amountKop,
+            Tax: "none",
+          },
+        ],
+      },
     };
 
     const data = await postTinkoff("Init", payload);
-    if (!data.Success) return res.status(400).json(data);
+    if (!data.Success) {
+      console.log("❌ Tinkoff Init failed");
+      return res.status(400).json(data);
+    }
 
-    await db.collection("telegramUsers")
+    // === Firestore запись заказа ===
+    console.log("🔥 Saving new order to Firestore");
+    await db
+      .collection("telegramUsers")
       .doc(userId)
       .collection("orders")
       .doc(finalOrderId)
       .set({
         orderId: finalOrderId,
-        amountInKopecks,
+        amountKop,
         currency,
-        usdToRub,
+        usdRate: rate,
         description,
         tinkoff: { PaymentId: data.PaymentId, PaymentURL: data.PaymentURL },
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
       });
 
-    res.json({ PaymentURL: data.PaymentURL, PaymentId: data.PaymentId });
+    res.json({
+      PaymentURL: data.PaymentURL,
+      PaymentId: data.PaymentId,
+      orderId: finalOrderId,
+    });
   } catch (err) {
-    console.error("Init error:", err);
+    console.error("❌ /init error:", err);
     res.status(500).json({ error: err.message });
   }
 });
 
 // === FinishAuthorize ===
 router.post("/finish-authorize", async (req, res) => {
+  console.log("➡️ /api/finish-authorize BODY:", req.body);
+
   try {
     const { userId, orderId, paymentId, amount, description } = req.body;
-    if (!userId || !orderId || !paymentId || !amount || !description)
-      return res.status(400).json({ error: "Missing parameters" });
 
-    const amountInKopecks = Math.round(Number(amount) * 100);
+    if (!userId || !orderId || !paymentId || !amount || !description) {
+      console.log("❌ Missing params finish-authorize");
+      return res.status(400).json({ error: "Missing params" });
+    }
+
+    const amountKop = Math.round(amount * 100);
+    console.log("🧾 Finish amount:", amountKop);
 
     const token = generateTinkoffTokenFinish({
-      Amount: amountInKopecks,
+      Amount: amountKop,
       CustomerKey: userId,
       Description: description,
       OrderId: orderId,
@@ -164,16 +198,22 @@ router.post("/finish-authorize", async (req, res) => {
     const payload = {
       TerminalKey: TINKOFF_TERMINAL_KEY,
       PaymentId: paymentId,
-      Amount: amountInKopecks,
+      Amount: amountKop,
       OrderId: orderId,
       Description: description,
       Token: token,
     };
 
     const data = await postTinkoff("FinishAuthorize", payload);
-    if (!data.Success) return res.status(400).json(data);
+    if (!data.Success) {
+      console.log("❌ Finish authorize failed");
+      return res.status(400).json(data);
+    }
 
-    await db.collection("telegramUsers")
+    console.log("🔥 Updating order in Firestore");
+
+    await db
+      .collection("telegramUsers")
       .doc(userId)
       .collection("orders")
       .doc(orderId)
@@ -185,7 +225,7 @@ router.post("/finish-authorize", async (req, res) => {
 
     res.json(data);
   } catch (err) {
-    console.error("FinishAuthorize error:", err);
+    console.error("❌ /finish-authorize error:", err);
     res.status(500).json({ error: err.message });
   }
 });
