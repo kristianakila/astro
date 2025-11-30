@@ -12,12 +12,13 @@ const TINKOFF_API_URL = "https://securepay.tinkoff.ru/v2";
 
 // === Генерация токена Init / Recurrent ===
 function generateTinkoffToken(payload) {
-  // сортировка ключей по алфавиту
-  const keys = Object.keys(payload).sort();
-  const str = keys.map(k => payload[k] || "").join("") + TINKOFF_PASSWORD + TINKOFF_TERMINAL_KEY;
+  // исключаем Token и TerminalKey
+  const keys = Object.keys(payload).filter(k => k !== "Token" && k !== "TerminalKey").sort();
+  const str = keys.map(k => payload[k] !== undefined ? payload[k] : "").join("") + TINKOFF_PASSWORD + TINKOFF_TERMINAL_KEY;
   console.log("🔐 Token RAW:", str);
   return crypto.createHash("sha256").update(str, "utf8").digest("hex");
 }
+
 
 // === POST к Tinkoff API ===
 async function postTinkoff(method, payload) {
