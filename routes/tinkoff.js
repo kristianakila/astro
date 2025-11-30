@@ -195,29 +195,47 @@ router.post("/finish-authorize", async (req, res) => {
 router.post("/get-rebill", async (req, res) => {
   try {
     const { paymentId } = req.body;
-    if (!paymentId) return res.status(400).json({ error: "Missing paymentId" });
+    if (!paymentId) {
+      return res.status(400).json({ error: "Missing paymentId" });
+    }
 
+    // 🔹 Формирование сигнатуры GetState
     const payload = {
       TerminalKey: TINKOFF_TERMINAL_KEY,
       PaymentId: paymentId,
     };
 
-    // 🔹 Правильный токен для GetState
-    const tokenRaw = `${TINKOFF_PASSWORD}${payload.TerminalKey}${payload.PaymentId}`;
-    payload.Token = crypto.createHash("sha256").update(tokenRaw, "utf8").digest("hex");
+    // 🔥 ВАЖНО — токен от Tinkoff считается ТОЛЬКО по полям:
+    // Password + PaymentId + TerminalKey
+    const signString = `${TINKOFF_PASSWORD}${payload.PaymentId}${payload.TerminalKey}`;
+    payload.Token = crypto.createHash("sha256").update(signString).digest("hex");
 
-    const resp = await fetch(`${TINKOFF_API_URL}/GetState`, {
+    console.log("📤 Sending to Tinkoff GetState:", payload);
+
+    const response = await fetch(`${TINKOFF_API_URL}/GetState`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
 
-    const data = await resp.json();
+    const data = await response.json();
     console.log("📥 Tinkoff GetState response:", data);
 
-    if (!data.Success) return res.status(400).json(data);
+    if (!data.Success) {
+      return res.status(400).json({
+        Success: false,
+        ErrorCode: data.ErrorCode,
+        Message: data.Message,
+        Details: data.Details
+      });
+    }
 
-    res.json({ RebillId: data.RebillId || null, Status: data.Status });
+    res.json({
+      Success: true,
+      RebillId: data.RebillId || null,
+      Status: data.Status || null
+    });
+
   } catch (err) {
     console.error("❌ /get-rebill error:", err);
     res.status(500).json({ error: err.message });
