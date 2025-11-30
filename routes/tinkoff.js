@@ -85,28 +85,31 @@ router.post("/init", async (req, res) => {
       RebillId: "", // пусто для новой рекуррентной операции
     });
 
-    const payload = {
-      TerminalKey: TINKOFF_TERMINAL_KEY,
-      Amount: amountKop,
-      OrderId: orderId,
-      Description: description,
-      CustomerKey: userId,
-      Token: token,
-      Receipt: {
-        Email: "test@example.com",
-        Taxation: "usn_income",
-        Items: [
-          {
-            Name: description,
-            Price: amountKop,
-            Quantity: 1,
-            Amount: amountKop,
-            Tax: "none",
-          },
-        ],
+const payload = {
+  TerminalKey: TINKOFF_TERMINAL_KEY,
+  Amount: amountKop,
+  OrderId: orderId,
+  Description: description,
+  CustomerKey: userId,
+  Token: token,
+  Recurrent: true,
+  Receipt: {
+    Email: "test@example.com",
+    Taxation: "usn_income",
+    Items: [
+      {
+        Name: description,
+        Price: amountKop,
+        Quantity: 1,
+        Amount: amountKop,
+        Tax: "none",
+        Object: "service",
+        VAT: "1",
       },
-      // Tinkoff сам создаст RebillId после первой оплаты, если пользователь сохранит карту
-    };
+    ],
+  },
+};
+
 
     const data = await postTinkoff("Init", payload);
     if (!data.Success) return res.status(400).json(data);
