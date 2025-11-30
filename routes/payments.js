@@ -3,7 +3,7 @@ import admin from "firebase-admin";
 import fetch from "node-fetch";
 import crypto from "crypto";
 import iconv from 'iconv-lite'
-import { parseStringPromise } from "xml2js"; // npm i xml2js
+import { parseStringPromise } from "xml2js";
 
 // === Константы Tinkoff ===
 const TINKOFF_TERMINAL_KEY = "1691507148627";
@@ -16,6 +16,7 @@ if (!admin.apps.length) {
     credential: admin.credential.applicationDefault(),
   });
 }
+
 const db = admin.firestore();
 
 // === Генерация токена Init ===
@@ -42,7 +43,7 @@ async function postTinkoff(method, payload) {
 
 const router = express.Router();
 
-// === Получение курса USD → RUB с fallback на Firebase ===
+// === Курс USD → RUB ===
 async function getUsdToRubRate() {
   try {
     const today = new Date();
@@ -74,8 +75,7 @@ async function getUsdToRubRate() {
   }
 }
 
-
-// === Init платежа с курсом USD → RUB ===
+// === Init ===
 router.post("/init", async (req, res) => {
   try {
     const { amount, currency = "RUB", userId, orderId, description } = req.body;
@@ -83,9 +83,7 @@ router.post("/init", async (req, res) => {
       return res.status(400).json({ error: "Missing amount, userId or description" });
 
     let usdToRub = 1;
-    if (currency === "USD") {
-      usdToRub = await getUsdToRubRate();
-    }
+    if (currency === "USD") usdToRub = await getUsdToRubRate();
 
     let amountInRub = Number(amount);
     if (currency === "USD") amountInRub = amountInRub * usdToRub;
@@ -193,4 +191,3 @@ router.post("/finish-authorize", async (req, res) => {
 });
 
 export default router;
-
