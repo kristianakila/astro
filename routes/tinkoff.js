@@ -86,28 +86,26 @@ router.post("/init", async (req, res) => {
     });
 
 const payload = {
+  TerminalKey: TINKOFF_TERMINAL_KEY,
   Amount: amountKop,
-  CustomerKey: userId,
-  Description: description,
   OrderId: orderId,
+  Description: description,
+  CustomerKey: userId,
+  Token: token,
   Receipt: {
     Email: "test@example.com",
     Taxation: "usn_income",
     Items: [
       {
-        Amount: amountKop,
         Name: description,
-        Object: "service",
         Price: amountKop,
         Quantity: 1,
+        Amount: amountKop,
         Tax: "none",
-        VAT: "1",
       },
     ],
   },
-  Recurrent: true,
-  TerminalKey: TINKOFF_TERMINAL_KEY,
-  Token: token,
+  // Tinkoff сам создаст RebillId после первой оплаты, если пользователь сохранит карту
 };
 
 
