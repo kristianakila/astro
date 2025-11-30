@@ -1,9 +1,7 @@
 import express from "express";
-import crypto from "crypto";
+import { db } from "../firebase.js";  // 🔹 импорт Firestore
 import fetch from "node-fetch";
-import iconv from "iconv-lite";
-import { parseStringPromise } from "xml2js";
-import { db } from "../index.js"; // <<< Firestore теперь отсюда
+import crypto from "crypto";
 import admin from "firebase-admin";
 
 const router = express.Router();
@@ -43,70 +41,24 @@ async function postTinkoff(method, payload) {
   return data;
 }
 
-// === Курс USD → RUB ===
-async function getUsdToRubRate() {
-  try {
-    const today = new Date();
-    const dd = String(today.getDate()).padStart(2, "0");
-    const mm = String(today.getMonth() + 1).padStart(2, "0");
-    const yyyy = today.getFullYear();
-    const dateStr = `${dd}/${mm}/${yyyy}`;
-
-    const cbUrl = `https://www.cbr.ru/scripts/XML_daily.asp?date_req=${dateStr}`;
-    console.log("📡 Fetching CBR:", cbUrl);
-
-    const resp = await fetch(cbUrl);
-    if (!resp.ok) throw new Error("CBR fetch failed");
-
-    const buffer = await resp.arrayBuffer();
-    const text = iconv.decode(Buffer.from(buffer), "win1251");
-
-    const match = text.match(
-      /<Valute\s+ID="[^"]*">[\s\S]*?<CharCode>USD<\/CharCode>[\s\S]*?<Nominal>(\d+)<\/Nominal>[\s\S]*?<Value>([\d,]+)<\/Value>[\s\S]*?<\/Valute>/i
-    );
-
-    if (!match) throw new Error("USD not found in XML");
-
-    const nominal = parseInt(match[1], 10);
-    const value = parseFloat(match[2].replace(",", "."));
-    const rate = value / nominal;
-
-    console.log("💱 CBR USD/RUB:", rate);
-    return rate;
-  } catch (err) {
-    console.warn("⚠️ CBR error, fallback:", err.message);
-
-    const doc = await db.collection("settings").doc("exchangeRates").get();
-    const val = doc.exists ? doc.data().USD_RUB : 100;
-
-    console.log("💱 Using fallback USD/RUB:", val);
-    return val;
-  }
-}
-
-// === Init ===
+// === Init платежа ===
 router.post("/init", async (req, res) => {
   console.log("➡️ /api/init BODY:", req.body);
 
   try {
-    const { amount, currency = "RUB", userId, orderId, description } = req.body;
+    const { amount, userId, orderId, description } = req.body;
 
     if (!amount || !userId || !description) {
       console.log("❌ Missing params");
       return res.status(400).json({ error: "Missing amount, userId, description" });
     }
 
-    // === Конвертация при USD ===
-    let rate = 1;
-    if (currency === "USD") rate = await getUsdToRubRate();
-
-    const amountRub = currency === "USD" ? amount * rate : amount;
-    const amountKop = Math.round(amountRub * 100);
+    const amountKop = Math.round(amount * 100);
 
     const finalOrderId =
       (orderId || `ORD-${Date.now()}-${Math.floor(Math.random() * 9000 + 1000)}`).slice(0, 36);
 
-    console.log("🧾 Amount RUB:", amountRub, "Kopecks:", amountKop);
+    console.log("🧾 Amount RUB:", amount, "Kopecks:", amountKop);
     console.log("🧾 OrderId:", finalOrderId);
 
     const token = generateTinkoffTokenInit({
@@ -144,7 +96,6 @@ router.post("/init", async (req, res) => {
       return res.status(400).json(data);
     }
 
-    // === Firestore запись заказа ===
     console.log("🔥 Saving new order to Firestore");
     await db
       .collection("telegramUsers")
@@ -154,8 +105,7 @@ router.post("/init", async (req, res) => {
       .set({
         orderId: finalOrderId,
         amountKop,
-        currency,
-        usdRate: rate,
+        currency: "RUB",
         description,
         tinkoff: { PaymentId: data.PaymentId, PaymentURL: data.PaymentURL },
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -172,7 +122,7 @@ router.post("/init", async (req, res) => {
   }
 });
 
-// === FinishAuthorize ===
+// === FinishAuthorize платежа ===
 router.post("/finish-authorize", async (req, res) => {
   console.log("➡️ /api/finish-authorize BODY:", req.body);
 
@@ -211,7 +161,6 @@ router.post("/finish-authorize", async (req, res) => {
     }
 
     console.log("🔥 Updating order in Firestore");
-
     await db
       .collection("telegramUsers")
       .doc(userId)
