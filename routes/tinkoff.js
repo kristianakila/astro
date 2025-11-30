@@ -12,8 +12,9 @@ const TINKOFF_PASSWORD = "rlkzhollw74x8uvv";
 const TINKOFF_API_URL = "https://securepay.tinkoff.ru/v2";
 
 // === Генерация токена Init ===
-function generateTinkoffTokenInit({ Amount, CustomerKey, Description, OrderId }) {
-  const raw = `${Amount}${CustomerKey}${Description}${OrderId}${TINKOFF_PASSWORD}${TINKOFF_TERMINAL_KEY}`;
+function generateTinkoffTokenInit({ Amount, CustomerKey, Description, OrderId, RebillId }) {
+  // для рекуррентных платежей RebillId учитывается в токене
+  const raw = `${Amount}${CustomerKey}${Description}${OrderId}${RebillId || ""}${TINKOFF_PASSWORD}${TINKOFF_TERMINAL_KEY}`;
   console.log("🔐 Token Init RAW:", raw);
   return crypto.createHash("sha256").update(raw, "utf8").digest("hex");
 }
@@ -46,7 +47,7 @@ router.post("/init", async (req, res) => {
   console.log("➡️ /api/init BODY:", req.body);
 
   try {
-    const { amount, userId, orderId, description } = req.body;
+    const { amount, userId, orderId, description, rebillId } = req.body;
 
     if (!amount || !userId || !description) {
       console.log("❌ Missing params");
@@ -66,6 +67,7 @@ router.post("/init", async (req, res) => {
       CustomerKey: userId,
       Description: description,
       OrderId: finalOrderId,
+      RebillId: rebillId || ""
     });
 
     const payload = {
@@ -88,6 +90,7 @@ router.post("/init", async (req, res) => {
           },
         ],
       },
+      RebillId: rebillId || "", // пустой для разового, ID для рекуррентного
     };
 
     const data = await postTinkoff("Init", payload);
@@ -108,6 +111,7 @@ router.post("/init", async (req, res) => {
         currency: "RUB",
         description,
         tinkoff: { PaymentId: data.PaymentId, PaymentURL: data.PaymentURL },
+        rebillId: data.RebillId || null,
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
       });
 
@@ -115,6 +119,7 @@ router.post("/init", async (req, res) => {
       PaymentURL: data.PaymentURL,
       PaymentId: data.PaymentId,
       orderId: finalOrderId,
+      rebillId: data.RebillId || null
     });
   } catch (err) {
     console.error("❌ /init error:", err);
