@@ -26,6 +26,31 @@ function generateTinkoffTokenFinish({ Amount, CustomerKey, Description, OrderId,
   return crypto.createHash("sha256").update(raw, "utf8").digest("hex");
 }
 
+
+// === Получение RebillId через GetState ===
+async function getTinkoffState(paymentId) {
+  const payload = {
+    TerminalKey: TINKOFF_TERMINAL_KEY,
+    PaymentId: paymentId,
+  };
+
+  // Токен для GetState
+  const raw = `${payload.PaymentId}${TINKOFF_PASSWORD}${TINKOFF_TERMINAL_KEY}`;
+  payload.Token = crypto.createHash("sha256").update(raw, "utf8").digest("hex");
+
+  const resp = await fetch(`${TINKOFF_API_URL}/GetState`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+
+  const data = await resp.json();
+  console.log("📥 Tinkoff GetState response:", data);
+
+  return data.RebillId || null;
+}
+
+
 // === POST к Tinkoff API ===
 async function postTinkoff(method, payload) {
   console.log(`📤 Tinkoff request: ${method}`, payload);
@@ -129,19 +154,15 @@ router.post("/init", async (req, res) => {
 
 // === FinishAuthorize платежа ===
 router.post("/finish-authorize", async (req, res) => {
-  console.log("➡️ /api/finish-authorize BODY:", req.body);
-
   try {
     const { userId, orderId, paymentId, amount, description } = req.body;
-
     if (!userId || !orderId || !paymentId || !amount || !description) {
-      console.log("❌ Missing params finish-authorize");
       return res.status(400).json({ error: "Missing params" });
     }
 
     const amountKop = Math.round(amount * 100);
-    console.log("🧾 Finish amount:", amountKop);
 
+    // Генерируем токен и вызываем FinishAuthorize
     const token = generateTinkoffTokenFinish({
       Amount: amountKop,
       CustomerKey: userId,
@@ -160,28 +181,29 @@ router.post("/finish-authorize", async (req, res) => {
     };
 
     const data = await postTinkoff("FinishAuthorize", payload);
-    if (!data.Success) {
-      console.log("❌ Finish authorize failed");
-      return res.status(400).json(data);
-    }
+    if (!data.Success) return res.status(400).json(data);
 
-    console.log("🔥 Updating order in Firestore");
+    // ✅ Получаем RebillId после FinishAuthorize
+    const rebillId = await getTinkoffState(paymentId);
+
+    // Обновляем заказ в Firestore с RebillId
     await db
       .collection("telegramUsers")
       .doc(userId)
       .collection("orders")
       .doc(orderId)
       .update({
-        description,
         tinkoff: { ...data },
+        rebillId,
         finishedAt: admin.firestore.FieldValue.serverTimestamp(),
       });
 
-    res.json(data);
+    res.json({ ...data, rebillId });
   } catch (err) {
     console.error("❌ /finish-authorize error:", err);
     res.status(500).json({ error: err.message });
   }
 });
+
 
 export default router;
