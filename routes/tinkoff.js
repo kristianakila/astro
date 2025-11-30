@@ -86,29 +86,30 @@ router.post("/init", async (req, res) => {
     });
 
 const payload = {
-  TerminalKey: TINKOFF_TERMINAL_KEY,
   Amount: amountKop,
-  OrderId: orderId,
-  Description: description,
   CustomerKey: userId,
-  Token: token,
-  Recurrent: true,
+  Description: description,
+  OrderId: orderId,
   Receipt: {
     Email: "test@example.com",
     Taxation: "usn_income",
     Items: [
       {
+        Amount: amountKop,
         Name: description,
+        Object: "service",
         Price: amountKop,
         Quantity: 1,
-        Amount: amountKop,
         Tax: "none",
-        Object: "service",
         VAT: "1",
       },
     ],
   },
+  Recurrent: true,
+  TerminalKey: TINKOFF_TERMINAL_KEY,
+  Token: token,
 };
+
 
 
     const data = await postTinkoff("Init", payload);
