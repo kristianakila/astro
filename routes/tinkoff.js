@@ -90,7 +90,6 @@ const payload = {
   Amount: amountKop,
   OrderId: orderId,
   Description: description,
-  Recurrent: 1,
   CustomerKey: userId,
   Token: token,
   Receipt: {
