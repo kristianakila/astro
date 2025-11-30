@@ -1,6 +1,5 @@
 fastapi==0.104.1
-uvicorn[standard]==0.24.0
-firebase-admin==5.2.0  # Более старая версия без новых зависимостей
+uvicorn==0.24.0
+firebase-admin==5.2.0
 requests==2.31.0
-pydantic==1.10.12  # Старая версия pydantic
-python-multipart==0.0.6
+pydantic==1.10.12
