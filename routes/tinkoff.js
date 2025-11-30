@@ -94,7 +94,7 @@ router.post("/init", async (req, res) => {
       Token: token,
       Receipt: {
         Email: "test@example.com",
-        Taxation: "osn",
+        Taxation: "usn_income",
         Items: [
           {
             Name: description,
