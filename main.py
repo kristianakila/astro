@@ -3,36 +3,8 @@ from pydantic import BaseModel
 import os
 import requests
 import hashlib
-import firebase_admin
-from firebase_admin import credentials, firestore
-from datetime import datetime
 
-print("🚀 Starting minimal Payment API...")
-
-# Минимальная инициализация Firebase
-def init_firebase():
-    if not firebase_admin._apps:
-        firebase_private_key = os.getenv("FIREBASE_PRIVATE_KEY")
-        if firebase_private_key:
-            firebase_config = {
-                "type": "service_account",
-                "project_id": os.getenv("FIREBASE_PROJECT_ID"),
-                "private_key_id": os.getenv("FIREBASE_PRIVATE_KEY_ID"),
-                "private_key": firebase_private_key.replace('\\n', '\n'),
-                "client_email": os.getenv("FIREBASE_CLIENT_EMAIL"),
-                "client_id": os.getenv("FIREBASE_CLIENT_ID"),
-                "client_x509_cert_url": os.getenv("FIREBASE_CLIENT_X509_CERT_URL"),
-            }
-            cred = credentials.Certificate(firebase_config)
-            firebase_admin.initialize_app(cred)
-            print("✅ Firebase initialized")
-        else:
-            print("❌ Firebase private key not found")
-            return None
-    return firestore.client()
-
-# Инициализируем Firebase
-db = init_firebase()
+print("🚀 Starting ultra-minimal Payment API...")
 
 # Создаем приложение
 app = FastAPI(title="Payment API", version="1.0.0")
@@ -66,18 +38,16 @@ def generate_token(data: dict) -> str:
 # Основные эндпоинты
 @app.get("/")
 def root():
-    return {"status": "ok", "message": "Minimal Payment API"}
+    return {"status": "ok", "message": "Ultra-minimal Payment API"}
 
 @app.get("/health")
 def health_check():
-    if db:
-        return {"status": "healthy", "firebase": "connected"}
-    return {"status": "degraded", "firebase": "disconnected"}
+    return {"status": "healthy", "firebase": "disabled"}
 
 @app.post("/api/init-payment")
 async def init_payment(payment_request: PaymentRequest):
     try:
-        print(f"💳 Payment request: {payment_request}")
+        print(f"💳 Payment request received: {payment_request.dict()}")
         
         # Генерируем токен
         token_data = {
@@ -121,56 +91,40 @@ async def init_payment(payment_request: PaymentRequest):
         print(f"📥 Tinkoff response: {data}")
 
         if data.get("Success"):
-            # Сохраняем в Firebase
-            if db:
-                db.collection("telegramUsers").document(payment_request.customerKey).set({
-                    "orderId": payment_request.orderId,
-                    "productType": payment_request.productType,
-                    "tinkoff": {
-                        "PaymentId": data["PaymentId"],
-                        "PaymentURL": data["PaymentURL"],
-                    },
-                    "updatedAt": datetime.utcnow()
-                }, merge=True)
-                print("✅ Data saved to Firebase")
-
-            return {"PaymentURL": data["PaymentURL"], "PaymentId": data["PaymentId"]}
+            return {
+                "PaymentURL": data["PaymentURL"], 
+                "PaymentId": data["PaymentId"],
+                "message": "Payment initialized successfully"
+            }
         else:
             error_msg = f"Tinkoff error: {data.get('Message')}"
             print(f"❌ {error_msg}")
             raise HTTPException(status_code=400, detail=error_msg)
 
     except Exception as e:
-        print(f"❌ Error: {e}")
+        print(f"❌ Error in init-payment: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/tinkoff-callback")
 async def tinkoff_callback(request: dict):
     try:
-        print(f"🔥 Callback received: {request}")
-        
-        # Простая обработка callback
-        if db and request.get("CustomerKey"):
-            customer_key = request.get("CustomerKey")
-            status = request.get("Status")
-            
-            db.collection("telegramUsers").document(customer_key).set({
-                "tinkoff": {
-                    "lastCallback": request,
-                    "updatedAt": datetime.utcnow()
-                }
-            }, merge=True)
-            
-            print(f"✅ Callback processed for user: {customer_key}, status: {status}")
-        
-        return {"Success": True}
+        print(f"🔥 POST Callback received: {request}")
+        return {"Success": True, "message": "Callback processed"}
     except Exception as e:
         print(f"❌ Callback error: {e}")
         return {"Success": False}
 
 @app.get("/api/tinkoff-callback")
-async def tinkoff_callback_get(request: dict):
-    print(f"🌐 GET Callback received: {request}")
+async def tinkoff_callback_get():
+    print(f"🌐 GET Callback received")
     return {"Success": True}
 
-print("✅ Minimal Payment API started successfully!")
+@app.get("/api/test")
+def test_endpoint():
+    return {
+        "status": "working", 
+        "terminal_key": bool(TERMINAL_KEY),
+        "secret_key": bool(SECRET_KEY)
+    }
+
+print("✅ Ultra-minimal Payment API started successfully!")
