@@ -192,43 +192,108 @@ router.post("/finish-authorize", async (req, res) => {
 });
 
 // === Получение RebillId через GetState ===
+// === Получение RebillId через GetState ===
 router.post("/get-rebill", async (req, res) => {
   try {
+    console.log("\n============================");
+    console.log("🟦 /api/get-rebill START");
+    console.log("============================");
+
+    console.log("📥 Incoming body:", req.body);
+
     const { paymentId } = req.body;
-    if (!paymentId) return res.status(400).json({ error: "Missing paymentId" });
+    if (!paymentId) {
+      console.log("❌ Missing paymentId");
+      return res.status(400).json({ error: "Missing paymentId" });
+    }
+
+    // Логи ключей (маскируем!)
+    console.log("🔐 Using TerminalKey:", String(TINKOFF_TERMINAL_KEY));
+    console.log(
+      "🔐 Using Password:",
+      TINKOFF_PASSWORD ? TINKOFF_PASSWORD.replace(/./g, "*") : "EMPTY"
+    );
 
     const payload = {
       TerminalKey: TINKOFF_TERMINAL_KEY,
       PaymentId: paymentId,
     };
 
-    // 🔥 Правильный токен для GetState
+    // === Формирование токена === //
     const tokenRaw = `${payload.TerminalKey}${payload.PaymentId}${TINKOFF_PASSWORD}`;
-    payload.Token = crypto
+
+    console.log("🧩 Token RAW string:", tokenRaw);
+    console.log("🧩 RAW length:", tokenRaw.length);
+
+    const tokenSha = crypto
       .createHash("sha256")
       .update(tokenRaw, "utf8")
       .digest("hex");
 
-    console.log("📤 Tinkoff GetState payload:", payload);
+    payload.Token = tokenSha;
 
-    const resp = await fetch(`${TINKOFF_API_URL}/GetState`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
+    console.log("🔐 Token SHA256:", tokenSha);
+    console.log("🔐 Token length:", tokenSha.length);
 
-    const data = await resp.json();
+    // === Лог URL Тинькофф === //
+    const url = `${TINKOFF_API_URL}/GetState`;
+    console.log("🌍 Tinkoff URL:", url);
+
+    // === Лог тела запроса === //
+    console.log("📤 Sending payload:", JSON.stringify(payload, null, 2));
+
+    // === TRY СЕТЕВОГО ЗАПРОСА === //
+    let resp;
+    try {
+      resp = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+    } catch (networkErr) {
+      console.error("❌ Network error while fetching Tinkoff:", networkErr);
+      return res.status(500).json({
+        error: "NetworkError",
+        details: networkErr.message,
+      });
+    }
+
+    console.log("🌐 HTTP status:", resp.status);
+
+    let data;
+    try {
+      data = await resp.json();
+    } catch (parseErr) {
+      console.error("❌ JSON parse error:", parseErr);
+      const text = await resp.text();
+      console.log("🔍 Raw response text:", text);
+
+      return res.status(500).json({
+        error: "JSONParseError",
+        details: parseErr.message,
+        raw: text,
+      });
+    }
+
     console.log("📥 Tinkoff GetState response:", data);
 
-    if (!data.Success) return res.status(400).json(data);
+    if (!data.Success) {
+      console.log("❌ Tinkoff returned error:", data);
+      return res.status(400).json(data);
+    }
 
-    res.json({
+    // === УСПЕХ === //
+    console.log("✅ SUCCESS RebillId:", data.RebillId);
+
+    return res.json({
       Status: data.Status,
       RebillId: data.RebillId || null,
+      PaymentId: paymentId,
     });
+
   } catch (err) {
-    console.error("❌ /get-rebill error:", err);
-    res.status(500).json({ error: err.message });
+    console.error("❌ GLOBAL /get-rebill error:", err);
+    return res.status(500).json({ error: err.message });
   }
 });
 
