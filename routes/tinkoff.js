@@ -191,4 +191,38 @@ router.post("/finish-authorize", async (req, res) => {
   }
 });
 
+// === Получение RebillId через GetState ===
+router.post("/get-rebill", async (req, res) => {
+  try {
+    const { paymentId } = req.body;
+    if (!paymentId) return res.status(400).json({ error: "Missing paymentId" });
+
+    const payload = {
+      TerminalKey: TINKOFF_TERMINAL_KEY,
+      PaymentId: paymentId,
+    };
+
+    // Токен для GetState
+    const raw = `${payload.PaymentId}${TINKOFF_PASSWORD}${TINKOFF_TERMINAL_KEY}`;
+    payload.Token = crypto.createHash("sha256").update(raw, "utf8").digest("hex");
+
+    const resp = await fetch(`${TINKOFF_API_URL}/GetState`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+
+    const data = await resp.json();
+    console.log("📥 Tinkoff GetState response:", data);
+
+    if (!data.Success) return res.status(400).json(data);
+
+    res.json({ RebillId: data.RebillId || null, Status: data.Status });
+  } catch (err) {
+    console.error("❌ /get-rebill error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
 export default router;
