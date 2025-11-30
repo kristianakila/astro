@@ -32,10 +32,9 @@ async function getTinkoffState(paymentId) {
     PaymentId: paymentId,
   };
 
-  const tokenRaw = `${payload.TerminalKey}${payload.PaymentId}${TINKOFF_PASSWORD}`;
-  payload.Token = crypto.createHash("sha256").update(tokenRaw, "utf8").digest("hex");
-
-  console.log("📤 GetState payload:", payload);
+  // Токен для GetState
+  const raw = `${payload.PaymentId}${TINKOFF_PASSWORD}${TINKOFF_TERMINAL_KEY}`;
+  payload.Token = crypto.createHash("sha256").update(raw, "utf8").digest("hex");
 
   const resp = await fetch(`${TINKOFF_API_URL}/GetState`, {
     method: "POST",
@@ -44,12 +43,13 @@ async function getTinkoffState(paymentId) {
   });
 
   const data = await resp.json();
-  console.log("📥 GetState response:", data);
+  console.log("📥 Tinkoff GetState response:", data);
 
+  // RebillId вернётся только если карта привязана для рекуррентного платежа
   return data.PaymentData?.RebillId || null;
 }
 
-// === Общий POST к Tinkoff API ===
+// === POST к Tinkoff API ===
 async function postTinkoff(method, payload) {
   console.log(`📤 Tinkoff request: ${method}`, payload);
 
@@ -68,7 +68,7 @@ async function postTinkoff(method, payload) {
 // === Init платежа ===
 router.post("/init", async (req, res) => {
   try {
-    const { amount, userId, description, phone, email } = req.body;
+    const { amount, userId, description } = req.body;
 
     if (!amount || !userId || !description) {
       return res.status(400).json({ error: "Missing amount, userId, description" });
@@ -82,42 +82,38 @@ router.post("/init", async (req, res) => {
       CustomerKey: userId,
       Description: description,
       OrderId: orderId,
-      RebillId: "",
+      RebillId: "", // пусто для новой рекуррентной операции
     });
 
-    const payload = {
-      Amount: amountKop,                     // A — Amount
-      Description: description,              // D — Description
-      Recurrent: true,                        // R — Recurrent
-      Receipt: {                             // R — Receipt
-        Email: email || "test@example.com",
-        Items: [
-          {
-            Name: description,
-            Price: amountKop,
-            Quantity: 1,
-            Amount: amountKop,
-            Object: "service",
-            VAT: "1",
-            Tax: "none",
-          },
-        ],
-        Taxation: "usn_income",
+const payload = {
+  TerminalKey: TINKOFF_TERMINAL_KEY,
+  Amount: amountKop,
+  OrderId: orderId,
+  Description: description,
+  CustomerKey: userId,
+  Token: token,
+  Receipt: {
+    Email: "test@example.com",
+    Taxation: "usn_income",
+    Items: [
+      {
+        Name: description,
+        Price: amountKop,
+        Quantity: 1,
+        Amount: amountKop,
+        Tax: "none",
       },
-      Phone: phone || "",
-      Email: email || "",
-      Expired: "",
-      Language: "ru",
-      ExtraParams: "",
-      TerminalKey: TINKOFF_TERMINAL_KEY,     // T — TerminalKey
-      Token: token,                           // T — Token
-      CustomerKey: userId,                    // C — CustomerKey
-      OrderId: orderId,                       // O — OrderId
-    };
+    ],
+  },
+  // Tinkoff сам создаст RebillId после первой оплаты, если пользователь сохранит карту
+};
+
+
 
     const data = await postTinkoff("Init", payload);
     if (!data.Success) return res.status(400).json(data);
 
+    // Сохраняем заказ в Firestore
     await db
       .collection("telegramUsers")
       .doc(userId)
@@ -129,7 +125,7 @@ router.post("/init", async (req, res) => {
         currency: "RUB",
         description,
         tinkoff: { PaymentId: data.PaymentId, PaymentURL: data.PaymentURL },
-        rebillId: null,
+        rebillId: null, // пока нет RebillId
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
       });
 
@@ -149,7 +145,6 @@ router.post("/init", async (req, res) => {
 router.post("/finish-authorize", async (req, res) => {
   try {
     const { userId, orderId, paymentId, amount, description } = req.body;
-
     if (!userId || !orderId || !paymentId || !amount || !description) {
       return res.status(400).json({ error: "Missing params" });
     }
@@ -176,8 +171,10 @@ router.post("/finish-authorize", async (req, res) => {
     const data = await postTinkoff("FinishAuthorize", payload);
     if (!data.Success) return res.status(400).json(data);
 
+    // ✅ Получаем RebillId после первой оплаты
     const rebillId = await getTinkoffState(paymentId);
 
+    // Обновляем заказ в Firestore
     await db
       .collection("telegramUsers")
       .doc(userId)
@@ -197,6 +194,7 @@ router.post("/finish-authorize", async (req, res) => {
 });
 
 // === Получение RebillId через GetState ===
+// === Получение RebillId через GetState ===
 router.post("/get-rebill", async (req, res) => {
   try {
     console.log("\n============================");
@@ -206,38 +204,101 @@ router.post("/get-rebill", async (req, res) => {
     console.log("📥 Incoming body:", req.body);
 
     const { paymentId } = req.body;
-    if (!paymentId) return res.status(400).json({ error: "Missing paymentId" });
+    if (!paymentId) {
+      console.log("❌ Missing paymentId");
+      return res.status(400).json({ error: "Missing paymentId" });
+    }
+
+    // Логи ключей (маскируем!)
+    console.log("🔐 Using TerminalKey:", String(TINKOFF_TERMINAL_KEY));
+    console.log(
+      "🔐 Using Password:",
+      TINKOFF_PASSWORD ? TINKOFF_PASSWORD.replace(/./g, "*") : "EMPTY"
+    );
 
     const payload = {
       TerminalKey: TINKOFF_TERMINAL_KEY,
       PaymentId: paymentId,
     };
 
+    // === Формирование токена === //
     const tokenRaw = `${payload.TerminalKey}${payload.PaymentId}${TINKOFF_PASSWORD}`;
-    payload.Token = crypto.createHash("sha256").update(tokenRaw, "utf8").digest("hex");
 
+    console.log("🧩 Token RAW string:", tokenRaw);
+    console.log("🧩 RAW length:", tokenRaw.length);
+
+    const tokenSha = crypto
+      .createHash("sha256")
+      .update(tokenRaw, "utf8")
+      .digest("hex");
+
+    payload.Token = tokenSha;
+
+    console.log("🔐 Token SHA256:", tokenSha);
+    console.log("🔐 Token length:", tokenSha.length);
+
+    // === Лог URL Тинькофф === //
+    const url = `${TINKOFF_API_URL}/GetState`;
+    console.log("🌍 Tinkoff URL:", url);
+
+    // === Лог тела запроса === //
     console.log("📤 Sending payload:", JSON.stringify(payload, null, 2));
 
-    const resp = await fetch(`${TINKOFF_API_URL}/GetState`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
+    // === TRY СЕТЕВОГО ЗАПРОСА === //
+    let resp;
+    try {
+      resp = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+    } catch (networkErr) {
+      console.error("❌ Network error while fetching Tinkoff:", networkErr);
+      return res.status(500).json({
+        error: "NetworkError",
+        details: networkErr.message,
+      });
+    }
 
-    const data = await resp.json();
-    console.log("📥 GetState response:", data);
+    console.log("🌐 HTTP status:", resp.status);
 
-    if (!data.Success) return res.status(400).json(data);
+    let data;
+    try {
+      data = await resp.json();
+    } catch (parseErr) {
+      console.error("❌ JSON parse error:", parseErr);
+      const text = await resp.text();
+      console.log("🔍 Raw response text:", text);
 
-    res.json({
+      return res.status(500).json({
+        error: "JSONParseError",
+        details: parseErr.message,
+        raw: text,
+      });
+    }
+
+    console.log("📥 Tinkoff GetState response:", data);
+
+    if (!data.Success) {
+      console.log("❌ Tinkoff returned error:", data);
+      return res.status(400).json(data);
+    }
+
+    // === УСПЕХ === //
+    console.log("✅ SUCCESS RebillId:", data.RebillId);
+
+    return res.json({
       Status: data.Status,
       RebillId: data.RebillId || null,
       PaymentId: paymentId,
     });
+
   } catch (err) {
-    console.error("❌ /get-rebill error:", err);
-    res.status(500).json({ error: err.message });
+    console.error("❌ GLOBAL /get-rebill error:", err);
+    return res.status(500).json({ error: err.message });
   }
 });
+
+
 
 export default router;
