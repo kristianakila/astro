@@ -25,11 +25,14 @@ from subscriptions.checker import start_subscription_checker
 app.include_router(payment_router, prefix="/api")
 
 # Запускаем проверку подписок
-start_subscription_checker()
+try:
+    start_subscription_checker()
+except Exception as e:
+    print(f"⚠️ Не удалось запустить проверку подписок: {e}")
 
 @app.get("/")
 def root():
-    return {"status": "ok", "message": "Payment API работает"}
+    return {"status": "ok", "message": "Payment API работает", "version": "v1.0.0"}
 
 @app.get("/health")
 def health_check():
@@ -40,12 +43,21 @@ def health_check():
     return {
         "status": status,
         "firebase": "connected" if firebase_status else "disconnected",
-        "timestamp": "2024-01-01T00:00:00Z"  # Здесь можно добавить реальное время
+        "dependencies": {
+            "fastapi": "0.104.1",
+            "firebase_admin": "5.2.0",
+            "pydantic": "1.10.12"
+        }
     }
 
+# Временный эндпоинт для отладки (удалите после настройки)
 @app.get("/debug/env")
 def debug_env():
-    """Эндпоинт для отладки переменных окружения (удалите после настройки)"""
+    """Эндпоинт для отладки переменных окружения"""
+    import pydantic
+    import firebase_admin
+    import fastapi
+    
     env_vars = {
         "FIREBASE_PROJECT_ID": os.getenv("FIREBASE_PROJECT_ID"),
         "FIREBASE_CLIENT_EMAIL": os.getenv("FIREBASE_CLIENT_EMAIL"),
@@ -53,5 +65,10 @@ def debug_env():
         "HAS_FIREBASE_PRIVATE_KEY": bool(os.getenv("FIREBASE_PRIVATE_KEY")),
         "TERMINAL_KEY": bool(os.getenv("TERMINAL_KEY")),
         "TELEGRAM_BOT_TOKEN": bool(os.getenv("TELEGRAM_BOT_TOKEN")),
+        "versions": {
+            "pydantic": pydantic.VERSION,
+            "fastapi": fastapi.__version__,
+            "firebase_admin": firebase_admin.__version__
+        }
     }
     return env_vars
