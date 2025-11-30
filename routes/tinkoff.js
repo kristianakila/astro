@@ -40,9 +40,12 @@ router.post("/init-payment", async (req, res) => {
     if (!amount || !customerKey || !description) 
       return res.status(400).json({ error: "Missing params" });
 
+    // 🔹 Конвертация в копейки
+    const amountKop = Math.round(amount * 100); // 1 рубль -> 100 копеек
+
     const orderId = `${customerKey}-${Date.now()}`;
     const payload = {
-      Amount: amount,
+      Amount: amountKop,
       CustomerKey: customerKey,
       Description: description,
       Email: email || "test@example.com",
@@ -63,7 +66,7 @@ router.post("/init-payment", async (req, res) => {
       .doc(orderId)
       .set({
         orderId,
-        amount,
+        amountKop,               // сохраняем сумму в копейках
         description,
         productType,
         tinkoff: { PaymentId: data.PaymentId, PaymentURL: data.PaymentURL },
@@ -84,7 +87,16 @@ router.post("/finish-authorize", async (req, res) => {
     const { customerKey, orderId, paymentId, amount, description } = req.body;
     if (!customerKey || !orderId || !paymentId) return res.status(400).json({ error: "Missing params" });
 
-    const payload = { Amount: amount, CustomerKey: customerKey, Description: description, OrderId: orderId, PaymentId: paymentId };
+    // 🔹 Конвертация в копейки
+    const amountKop = Math.round(amount * 100);
+
+    const payload = { 
+      Amount: amountKop, 
+      CustomerKey: customerKey, 
+      Description: description, 
+      OrderId: orderId, 
+      PaymentId: paymentId 
+    };
     payload.Token = generateTinkoffToken(payload);
     payload.TerminalKey = TINKOFF_TERMINAL_KEY;
 
