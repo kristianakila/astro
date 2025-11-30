@@ -202,9 +202,9 @@ router.post("/get-rebill", async (req, res) => {
       PaymentId: paymentId,
     };
 
-    // Токен для GetState
-    const raw = `${payload.PaymentId}${TINKOFF_PASSWORD}${TINKOFF_TERMINAL_KEY}`;
-    payload.Token = crypto.createHash("sha256").update(raw, "utf8").digest("hex");
+    // 🔹 Правильный токен для GetState
+    const tokenRaw = `${TINKOFF_PASSWORD}${payload.TerminalKey}${payload.PaymentId}`;
+    payload.Token = crypto.createHash("sha256").update(tokenRaw, "utf8").digest("hex");
 
     const resp = await fetch(`${TINKOFF_API_URL}/GetState`, {
       method: "POST",
@@ -223,6 +223,7 @@ router.post("/get-rebill", async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
 
 
 export default router;
