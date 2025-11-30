@@ -1,5 +1,5 @@
 import express from "express";
-import { db } from "../firebase.js";  // 🔹 импорт Firestore
+import { db } from "../firebase.js";
 import fetch from "node-fetch";
 import crypto from "crypto";
 import admin from "firebase-admin";
@@ -13,7 +13,6 @@ const TINKOFF_API_URL = "https://securepay.tinkoff.ru/v2";
 
 // === Генерация токена Init ===
 function generateTinkoffTokenInit({ Amount, CustomerKey, Description, OrderId, RebillId }) {
-  // для рекуррентных платежей RebillId учитывается в токене
   const raw = `${Amount}${CustomerKey}${Description}${OrderId}${RebillId || ""}${TINKOFF_PASSWORD}${TINKOFF_TERMINAL_KEY}`;
   console.log("🔐 Token Init RAW:", raw);
   return crypto.createHash("sha256").update(raw, "utf8").digest("hex");
@@ -25,7 +24,6 @@ function generateTinkoffTokenFinish({ Amount, CustomerKey, Description, OrderId,
   console.log("🔐 Token Finish RAW:", raw);
   return crypto.createHash("sha256").update(raw, "utf8").digest("hex");
 }
-
 
 // === Получение RebillId через GetState ===
 async function getTinkoffState(paymentId) {
@@ -47,9 +45,9 @@ async function getTinkoffState(paymentId) {
   const data = await resp.json();
   console.log("📥 Tinkoff GetState response:", data);
 
-  return data.RebillId || null;
+  // RebillId вернётся только если карта привязана для рекуррентного платежа
+  return data.PaymentData?.RebillId || null;
 }
-
 
 // === POST к Tinkoff API ===
 async function postTinkoff(method, payload) {
@@ -69,36 +67,28 @@ async function postTinkoff(method, payload) {
 
 // === Init платежа ===
 router.post("/init", async (req, res) => {
-  console.log("➡️ /api/init BODY:", req.body);
-
   try {
-    const { amount, userId, orderId, description, rebillId } = req.body;
+    const { amount, userId, description } = req.body;
 
     if (!amount || !userId || !description) {
-      console.log("❌ Missing params");
       return res.status(400).json({ error: "Missing amount, userId, description" });
     }
 
     const amountKop = Math.round(amount * 100);
-
-    const finalOrderId =
-      (orderId || `ORD-${Date.now()}-${Math.floor(Math.random() * 9000 + 1000)}`).slice(0, 36);
-
-    console.log("🧾 Amount RUB:", amount, "Kopecks:", amountKop);
-    console.log("🧾 OrderId:", finalOrderId);
+    const orderId = `ORD-${Date.now()}-${Math.floor(Math.random() * 9000 + 1000)}`.slice(0, 36);
 
     const token = generateTinkoffTokenInit({
       Amount: amountKop,
       CustomerKey: userId,
       Description: description,
-      OrderId: finalOrderId,
-      RebillId: rebillId || ""
+      OrderId: orderId,
+      RebillId: "", // пусто для новой рекуррентной операции
     });
 
     const payload = {
       TerminalKey: TINKOFF_TERMINAL_KEY,
       Amount: amountKop,
-      OrderId: finalOrderId,
+      OrderId: orderId,
       Description: description,
       CustomerKey: userId,
       Token: token,
@@ -115,36 +105,33 @@ router.post("/init", async (req, res) => {
           },
         ],
       },
-      RebillId: rebillId || "", // пустой для разового, ID для рекуррентного
+      // Tinkoff сам создаст RebillId после первой оплаты, если пользователь сохранит карту
     };
 
     const data = await postTinkoff("Init", payload);
-    if (!data.Success) {
-      console.log("❌ Tinkoff Init failed");
-      return res.status(400).json(data);
-    }
+    if (!data.Success) return res.status(400).json(data);
 
-    console.log("🔥 Saving new order to Firestore");
+    // Сохраняем заказ в Firestore
     await db
       .collection("telegramUsers")
       .doc(userId)
       .collection("orders")
-      .doc(finalOrderId)
+      .doc(orderId)
       .set({
-        orderId: finalOrderId,
+        orderId,
         amountKop,
         currency: "RUB",
         description,
         tinkoff: { PaymentId: data.PaymentId, PaymentURL: data.PaymentURL },
-        rebillId: data.RebillId || null,
+        rebillId: null, // пока нет RebillId
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
       });
 
     res.json({
       PaymentURL: data.PaymentURL,
       PaymentId: data.PaymentId,
-      orderId: finalOrderId,
-      rebillId: data.RebillId || null
+      orderId,
+      rebillId: null,
     });
   } catch (err) {
     console.error("❌ /init error:", err);
@@ -162,7 +149,6 @@ router.post("/finish-authorize", async (req, res) => {
 
     const amountKop = Math.round(amount * 100);
 
-    // Генерируем токен и вызываем FinishAuthorize
     const token = generateTinkoffTokenFinish({
       Amount: amountKop,
       CustomerKey: userId,
@@ -183,10 +169,10 @@ router.post("/finish-authorize", async (req, res) => {
     const data = await postTinkoff("FinishAuthorize", payload);
     if (!data.Success) return res.status(400).json(data);
 
-    // ✅ Получаем RebillId после FinishAuthorize
+    // ✅ Получаем RebillId после первой оплаты
     const rebillId = await getTinkoffState(paymentId);
 
-    // Обновляем заказ в Firestore с RebillId
+    // Обновляем заказ в Firestore
     await db
       .collection("telegramUsers")
       .doc(userId)
@@ -204,6 +190,5 @@ router.post("/finish-authorize", async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
-
 
 export default router;
