@@ -1,33 +1,20 @@
-// routes/payments.js
 import express from "express";
 import admin from "firebase-admin";
 import fetch from "node-fetch";
 import crypto from "crypto";
-import iconv from 'iconv-lite';
-import { parseStringPromise } from "xml2js";
+import iconv from 'iconv-lite'
+import { parseStringPromise } from "xml2js"; // npm i xml2js
 
-const router = express.Router();
+// === Константы Tinkoff ===
+const TINKOFF_TERMINAL_KEY = "1691507148627";
+const TINKOFF_PASSWORD = "rlkzhollw74x8uvv";
+const TINKOFF_API_URL = "https://securepay.tinkoff.ru/v2";
 
-// === Конфигурация через env ===
-const TINKOFF_TERMINAL_KEY = process.env.TINKOFF_TERMINAL_KEY;
-const TINKOFF_PASSWORD = process.env.TINKOFF_PASSWORD;
-const TINKOFF_API_URL = process.env.TINKOFF_API_URL || "https://securepay.tinkoff.ru/v2";
-
-// === Инициализация Firebase Admin ===
-// Найди этот код: (если у тебя в оригинале admin.initializeApp({...applicationDefault...}))
-// Замени на этот код:
+// === Firebase ===
 if (!admin.apps.length) {
-  // Ожидаем, что в env будет JSON серв. аккаунта в FIREBASE_SERVICE_ACCOUNT
-  if (!process.env.FIREBASE_SERVICE_ACCOUNT) {
-    console.error("FIREBASE_SERVICE_ACCOUNT env variable is required");
-    // Не бросаем ошибку тут, чтобы приложение могло стартовать в dev, но дальше будет ругаться при запросах
-  } else {
-    const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-    admin.initializeApp({
-      credential: admin.credential.cert(serviceAccount),
-      // optional: databaseURL: process.env.FIREBASE_DB_URL
-    });
-  }
+  admin.initializeApp({
+    credential: admin.credential.applicationDefault(),
+  });
 }
 const db = admin.firestore();
 
@@ -52,6 +39,8 @@ async function postTinkoff(method, payload) {
   });
   return await resp.json();
 }
+
+const router = express.Router();
 
 // === Получение курса USD → RUB с fallback на Firebase ===
 async function getUsdToRubRate() {
@@ -84,6 +73,7 @@ async function getUsdToRubRate() {
     return ratesData.USD_RUB;
   }
 }
+
 
 // === Init платежа с курсом USD → RUB ===
 router.post("/init", async (req, res) => {
@@ -199,7 +189,8 @@ router.post("/finish-authorize", async (req, res) => {
   } catch (err) {
     console.error("FinishAuthorize error:", err);
     res.status(500).json({ error: err.message });
-  } 
+  }
 });
 
 export default router;
+
