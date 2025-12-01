@@ -11,45 +11,55 @@ const TINKOFF_TERMINAL_KEY = "1691507148627";
 const TINKOFF_PASSWORD = "rlkzhollw74x8uvv";
 const TINKOFF_API_URL = "https://securepay.tinkoff.ru/v2";
 
+// ============================================================
+// === Универсальный генератор токена для Tinkoff Init ===
+// ============================================================
+function generateTinkoffInitToken(payload) {
+  const prepared = {};
 
-// === Генерация токена: сортировка параметров по алфавиту по именам ключей ===
-function generateTokenAlphabetical(params = {}, { appendTerminalKey = false } = {}) {
-  // Преобразуем значения в строки и удалим undefined/null
-  const kv = Object.entries(params)
-    .filter(([k, v]) => v !== undefined && v !== null)
-    .map(([k, v]) => [k, String(v)]);
+  // Сначала преобразуем все поля для подписи
+  for (const [key, value] of Object.entries(payload)) {
+    if (value === undefined || value === null) continue;
 
-  // Сортируем по имени ключа в лексикографическом (алфавитном) порядке
-  kv.sort((a, b) => a[0].localeCompare(b[0], "en"));
+    // Receipt должен быть JSON-строкой
+    if (key === "Receipt") {
+      prepared[key] = JSON.stringify(value);
+    } else {
+      prepared[key] = String(value);
+    }
+  }
 
-  // Конкатенируем только значения (в порядке отсортированных ключей)
-  const concatenated = kv.map(([, v]) => v).join("");
+  // Сортировка ключей строго по алфавиту (ASCII)
+  const sortedKeys = Object.keys(prepared).sort();
 
-  // В конце — пароль, и при необходимости TerminalKey
-  const raw = concatenated + TINKOFF_PASSWORD + (appendTerminalKey ? TINKOFF_TERMINAL_KEY : "");
+  // Формируем строку: key=valuekey=value...
+  const signature = sortedKeys
+    .map((k) => `${k}=${prepared[k]}`)
+    .join("");
 
-  console.log("🔐 Token Alphabetical RAW:", { order: kv.map(([k]) => k), rawPreview: raw.slice(0, 200) });
+  const raw = signature + TINKOFF_PASSWORD;
+
+  console.log("🔐 Signature Init RAW:", raw);
 
   return crypto.createHash("sha256").update(raw, "utf8").digest("hex");
 }
 
-// === Обёртка для рекуррентного токена ===
-function generateRecurrentToken(params) {
-  // В params передаём: amount, description, recurrent, receipt, phone, email, expired, taxation, language, extra_params
-  // Функция сама отсортирует поля по алфавиту и создаст SHA256(raw + password)
-  return generateTokenAlphabetical(params, { appendTerminalKey: false });
-}
-
-
+// ============================================================
 // === Генерация токена FinishAuthorize ===
-// === Генерация токена FinishAuthorize (с алфавитной сортировкой) ===
-function generateTinkoffTokenFinish(params) {
-  // Тinkoff требует в некоторых методах TerminalKey в raw — поэтому appendTerminalKey = true
-  // params ожидает поля: Amount, CustomerKey, Description, OrderId, PaymentId
-  // Мы сортируем имена полей по алфавиту и конкатенируем значения в этом порядке, затем добавляем пароль + TerminalKey
-  return generateTokenAlphabetical(params, { appendTerminalKey: true });
-}
+// ============================================================
+function generateTinkoffTokenFinish({ Amount, CustomerKey, Description, OrderId, PaymentId }) {
+  const raw =
+    `Amount=${Amount}` +
+    `CustomerKey=${CustomerKey}` +
+    `Description=${Description}` +
+    `OrderId=${OrderId}` +
+    `PaymentId=${PaymentId}` +
+    TINKOFF_PASSWORD;
 
+  console.log("🔐 Signature Finish RAW:", raw);
+
+  return crypto.createHash("sha256").update(raw, "utf8").digest("hex");
+}
 
 // === Получение RebillId через GetState ===
 async function getTinkoffState(paymentId) {
@@ -103,18 +113,15 @@ router.post("/init", async (req, res) => {
       });
     }
 
-    // Цена со скидкой (целое число!)
+    // Цена со скидкой
     const finalAmount = parseInt(priceNextMonth * (1 - discount / 100));
     const amountKop = finalAmount * 100;
 
-    const orderId = `ORD-${Date.now()}-${Math.floor(
-      Math.random() * 9000 + 1000
-    )}`.slice(0, 36);
+    const orderId = `ORD-${Date.now()}-${Math.floor(Math.random() * 9000 + 1000)}`.slice(0, 36);
 
-    // Описание рекуррентного списания
     const description = `Доступ к астро-асистенту [${priceNextMonth}р./мес.]`;
 
-    // === Формируем Receipt ===
+    // === Receipt ===
     const receiptObject = {
       Email: email || "",
       Phone: phone || "",
@@ -131,45 +138,25 @@ router.post("/init", async (req, res) => {
       ],
     };
 
-    const receiptString = JSON.stringify(receiptObject);
-
-    const recurrent = "1";
-    const expired = "";
-    const taxation = "usn_income";
-    const language = "ru";
-    const extra_params = "";
-
-    // === Генерируем токен строго в указанном порядке ===
-    const token = generateRecurrentToken({
-      amount: finalAmount,
-      description,
-      recurrent,
-      receipt: receiptString,
-      phone: phone || "",
-      email: email || "",
-      expired,
-      taxation,
-      language,
-      extra_params,
-    });
-
-    // === Payload Init ===
+    // Создаём payload БЕЗ Token
     const payload = {
       TerminalKey: TINKOFF_TERMINAL_KEY,
       Amount: amountKop,
       OrderId: orderId,
       Description: description,
       CustomerKey: userId,
-      Recurrent: recurrent,
-      Language: language,
+      Recurrent: "1",
+      Language: "ru",
       Receipt: receiptObject,
-      Token: token,
     };
+
+    // Генерируем токен
+    payload.Token = generateTinkoffInitToken(payload);
 
     const data = await postTinkoff("Init", payload);
     if (!data.Success) return res.status(400).json(data);
 
-    // Сохраняем заказ в Firestore
+    // Сохраняем заказ
     await db
       .collection("telegramUsers")
       .doc(userId)
@@ -200,7 +187,7 @@ router.post("/init", async (req, res) => {
 });
 
 // ============================================================
-// === FinishAuthorize (первая успешная оплата, получение RebillId)
+// === FinishAuthorize — получение RebillId ===
 // ============================================================
 
 router.post("/finish-authorize", async (req, res) => {
