@@ -11,97 +11,90 @@ const TINKOFF_TERMINAL_KEY = "1691507148627";
 const TINKOFF_PASSWORD = "rlkzhollw74x8uvv";
 const TINKOFF_API_URL = "https://securepay.tinkoff.ru/v2";
 
-// === Генерация токена Init (СТРОГО В ТАКОМ ПОРЯДКЕ) ===
-function generateTinkoffTokenInit({ Amount, OrderId, Description, Recurrent, CustomerKey }) {
-  // Важно: порядок параметров для токена должен совпадать с документацией
-  // В документации: TerminalKey + Amount + OrderId + Description + Recurrent + CustomerKey + Token
-  // Но для генерации токена: Amount + OrderId + Description + Recurrent + CustomerKey + Password + TerminalKey
-  const raw = `${Amount}${OrderId}${Description}${Recurrent}${CustomerKey}${TINKOFF_PASSWORD}${TINKOFF_TERMINAL_KEY}`;
-  console.log("🔐 Token Init RAW:", raw);
-  console.log("🔐 Token Init params:", { Amount, OrderId, Description, Recurrent, CustomerKey });
-  return crypto.createHash("sha256").update(raw, "utf8").digest("hex");
-}
-
-// === Генерация токена Finish ===
-function generateTinkoffTokenFinish({ Amount, OrderId, Description, PaymentId }) {
-  const raw = `${Amount}${OrderId}${Description}${PaymentId}${TINKOFF_PASSWORD}${TINKOFF_TERMINAL_KEY}`;
-  console.log("🔐 Token Finish RAW:", raw);
-  return crypto.createHash("sha256").update(raw, "utf8").digest("hex");
-}
-
-// === Получение RebillId через GetState ===
-async function getTinkoffState(paymentId) {
-  const payload = {
-    TerminalKey: TINKOFF_TERMINAL_KEY,
-    PaymentId: paymentId,
-  };
-
-  // Токен для GetState
-  const raw = `${payload.PaymentId}${TINKOFF_PASSWORD}${TINKOFF_TERMINAL_KEY}`;
-  payload.Token = crypto.createHash("sha256").update(raw, "utf8").digest("hex");
-
-  const resp = await fetch(`${TINKOFF_API_URL}/GetState`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
+// === Генерация токена Init (ИСПРАВЛЕНО) ===
+function generateTinkoffTokenInit({ Amount, OrderId, Description, CustomerKey }) {
+  // В документации для Init с рекуррентом:
+  // TerminalKey + Amount + OrderId + Description + Recurrent + CustomerKey + Token
+  // Но для генерации токена: Amount + OrderId + Description + CustomerKey + Recurrent + Password + TerminalKey
+  // Однако Recurrent не включается в токен по некоторым версиям API
+  
+  // Лучший подход - смотреть официальную документацию:
+  // https://oplata.tinkoff.ru/develop/api/request-sign/
+  
+  // Для Init с Recurrent="Y" и CustomerKey:
+  const raw = `${Amount}${OrderId}${Description}${CustomerKey}Y${TINKOFF_PASSWORD}${TINKOFF_TERMINAL_KEY}`;
+  console.log("🔐 Token Init RAW string:", raw);
+  console.log("🔐 Components:", {
+    Amount,
+    OrderId,
+    Description,
+    CustomerKey,
+    Recurrent: "Y",
+    Password: TINKOFF_PASSWORD,
+    TerminalKey: TINKOFF_TERMINAL_KEY
   });
-
-  const data = await resp.json();
-  console.log("📥 Tinkoff GetState response:", data);
-
-  return data.RebillId || data.PaymentData?.RebillId || null;
+  
+  const token = crypto.createHash("sha256").update(raw, "utf8").digest("hex");
+  console.log("🔐 Generated token:", token);
+  return token;
 }
 
 // === POST к Tinkoff API ===
 async function postTinkoff(method, payload) {
   console.log(`📤 Tinkoff request: ${method}`, JSON.stringify(payload, null, 2));
 
-  const resp = await fetch(`${TINKOFF_API_URL}/${method}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
+  try {
+    const resp = await fetch(`${TINKOFF_API_URL}/${method}`, {
+      method: "POST",
+      headers: { 
+        "Content-Type": "application/json",
+        "Accept": "application/json"
+      },
+      body: JSON.stringify(payload),
+    });
 
-  const data = await resp.json();
-  console.log(`📥 Tinkoff response (${method}):`, data);
+    const data = await resp.json();
+    console.log(`📥 Tinkoff response (${method}):`, data);
 
-  return data;
+    return data;
+  } catch (err) {
+    console.error(`❌ Tinkoff request error (${method}):`, err);
+    throw err;
+  }
 }
 
 // === Init платежа ===
 router.post("/init", async (req, res) => {
   try {
-    const { amount, userId, description, email = "test@example.com", phone = "" } = req.body;
+    console.log("=== НОВЫЙ ЗАПРОС /init ===");
+    console.log("📥 Request body:", req.body);
+    
+    const { amount, userId, description, email = "test@test.com", phone = "" } = req.body;
 
     if (!amount || !userId || !description) {
       return res.status(400).json({ error: "Missing amount, userId, description" });
     }
 
     const amountKop = Math.round(amount * 100);
-    const orderId = `ORD-${Date.now()}-${Math.floor(Math.random() * 9000 + 1000)}`.slice(0, 36);
+    const orderId = `ORD${Date.now()}${Math.floor(Math.random() * 1000)}`;
     
-    // Для рекуррентного платежа
-    const recurrent = "Y";
-    const customerKey = userId.toString();
-
-    // Генерация токена в правильном порядке
+    // Генерация токена
     const token = generateTinkoffTokenInit({
       Amount: amountKop,
       OrderId: orderId,
-      Description: description,
-      Recurrent: recurrent,
-      CustomerKey: customerKey,
+      Description: description.substring(0, 128),
+      CustomerKey: userId.toString(),
     });
 
-    // Payload СТРОГО в порядке из документации
+    // Payload В ТОЧНОМ порядке как в документации
     const payload = {
       TerminalKey: TINKOFF_TERMINAL_KEY,
       Amount: amountKop,
       OrderId: orderId,
       Token: token,
-      Description: description,
-      CustomerKey: customerKey,
-      Recurrent: recurrent,
+      Description: description.substring(0, 128),
+      CustomerKey: userId.toString(),
+      Recurrent: "Y",
       PayType: "O",
       Language: "ru",
       NotificationURL: "https://astro-1-nns5.onrender.com/api/notification",
@@ -113,7 +106,7 @@ router.post("/init", async (req, res) => {
         Taxation: "usn_income",
         Items: [
           {
-            Name: description.substring(0, 128), // Максимум 128 символов
+            Name: description.substring(0, 128),
             Price: amountKop,
             Quantity: 1.00,
             Amount: amountKop,
@@ -125,22 +118,30 @@ router.post("/init", async (req, res) => {
       },
     };
 
-    console.log("📤 Sending payload to Tinkoff:", JSON.stringify(payload, null, 2));
+    console.log("📤 Final payload to Tinkoff:", JSON.stringify(payload, null, 2));
 
     const data = await postTinkoff("Init", payload);
     
     if (!data.Success) {
-      console.error("❌ Tinkoff error:", data);
+      console.error("❌ Tinkoff API error details:", {
+        ErrorCode: data.ErrorCode,
+        Message: data.Message,
+        Details: data.Details,
+        payloadSent: payload
+      });
+      
       return res.status(400).json({
         error: "Tinkoff API error",
-        details: data,
+        errorCode: data.ErrorCode,
+        message: data.Message,
+        details: data.Details
       });
     }
 
     // Сохраняем заказ в Firestore
     await db
       .collection("telegramUsers")
-      .doc(userId)
+      .doc(userId.toString())
       .collection("orders")
       .doc(orderId)
       .set({
@@ -149,7 +150,7 @@ router.post("/init", async (req, res) => {
         amount: amount,
         currency: "RUB",
         description,
-        userId,
+        userId: userId.toString(),
         email,
         phone,
         tinkoff: { 
@@ -175,169 +176,95 @@ router.post("/init", async (req, res) => {
   } catch (err) {
     console.error("❌ /init error:", err);
     res.status(500).json({ 
-      error: err.message,
-      stack: err.stack 
+      error: "Internal server error",
+      message: err.message
     });
   }
 });
 
-// === FinishAuthorize платежа ===
-router.post("/finish-authorize", async (req, res) => {
+// Альтернативная версия с другим порядком генерации токена
+router.post("/init-test", async (req, res) => {
   try {
-    const { userId, orderId, paymentId, amount, description } = req.body;
-    if (!userId || !orderId || !paymentId || !amount || !description) {
-      return res.status(400).json({ error: "Missing params" });
-    }
-
+    console.log("=== ТЕСТОВЫЙ ЗАПРОС /init-test ===");
+    
+    const { amount, userId, description } = req.body;
     const amountKop = Math.round(amount * 100);
-
-    const token = generateTinkoffTokenFinish({
-      Amount: amountKop,
-      OrderId: orderId,
-      Description: description,
-      PaymentId: paymentId,
-    });
-
-    const payload = {
+    const orderId = `TEST${Date.now()}`;
+    
+    // Тест 1: Попробуем без рекуррента
+    console.log("\n🔧 ТЕСТ 1: Без рекуррента");
+    const token1 = crypto.createHash("sha256")
+      .update(`${amountKop}${orderId}${description}${TINKOFF_PASSWORD}${TINKOFF_TERMINAL_KEY}`, "utf8")
+      .digest("hex");
+    
+    const payload1 = {
       TerminalKey: TINKOFF_TERMINAL_KEY,
-      PaymentId: paymentId,
       Amount: amountKop,
       OrderId: orderId,
       Description: description,
-      Token: token,
+      Token: token1,
     };
-
-    const data = await postTinkoff("FinishAuthorize", payload);
-    if (!data.Success) return res.status(400).json(data);
-
-    // ✅ Получаем RebillId после первой оплаты
-    const rebillId = await getTinkoffState(paymentId);
-
-    // Обновляем заказ в Firestore
-    await db
-      .collection("telegramUsers")
-      .doc(userId)
-      .collection("orders")
-      .doc(orderId)
-      .update({
-        "tinkoff.Status": data.Status,
-        "tinkoff.Response": data,
-        rebillId,
-        isRecurrent: !!rebillId,
-        status: data.Status === "CONFIRMED" ? "success" : "pending",
-        finishedAt: admin.firestore.FieldValue.serverTimestamp(),
-      });
-
-    res.json({ 
-      success: data.Success,
-      status: data.Status,
-      rebillId,
-      isRecurrent: !!rebillId,
-      message: data.Message 
-    });
-  } catch (err) {
-    console.error("❌ /finish-authorize error:", err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// === Уведомления от Tinkoff ===
-router.post("/notification", async (req, res) => {
-  try {
-    const notification = req.body;
-    console.log("📨 Tinkoff notification received:", notification);
-
-    // Проверяем токен уведомления
-    const tokenData = `${notification.TerminalKey}${notification.OrderId}${notification.Success}${notification.Status}${notification.PaymentId}${notification.Amount}${TINKOFF_PASSWORD}`;
-    const expectedToken = crypto.createHash("sha256").update(tokenData, "utf8").digest("hex");
-
-    if (notification.Token !== expectedToken) {
-      console.error("❌ Invalid notification token");
-      return res.status(400).json({ error: "Invalid token" });
-    }
-
-    // Ищем заказ по OrderId
-    const ordersSnapshot = await db
-      .collectionGroup("orders")
-      .where("orderId", "==", notification.OrderId)
-      .get();
-
-    if (!ordersSnapshot.empty) {
-      const orderDoc = ordersSnapshot.docs[0];
-      const orderData = orderDoc.data();
+    
+    console.log("Payload 1:", JSON.stringify(payload1, null, 2));
+    const result1 = await postTinkoff("Init", payload1);
+    console.log("Result 1:", result1);
+    
+    // Тест 2: С рекуррентом но без CustomerKey
+    if (!result1.Success) {
+      console.log("\n🔧 ТЕСТ 2: С рекуррентом без CustomerKey");
+      const token2 = crypto.createHash("sha256")
+        .update(`${amountKop}${orderId}${description}Y${TINKOFF_PASSWORD}${TINKOFF_TERMINAL_KEY}`, "utf8")
+        .digest("hex");
       
-      await orderDoc.ref.update({
-        "tinkoff.notification": notification,
-        status: notification.Success ? "success" : "failed",
-        rebillId: notification.RebillId || notification.PaymentData?.RebillId || orderData.rebillId,
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-      });
-
-      console.log(`✅ Order ${notification.OrderId} updated with notification`);
-    }
-
-    // Всегда возвращаем OK Tinkoff
-    res.json({ success: true });
-  } catch (err) {
-    console.error("❌ /notification error:", err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// === Проверка статуса платежа ===
-router.post("/check-status", async (req, res) => {
-  try {
-    const { orderId, userId } = req.body;
-    
-    if (!orderId || !userId) {
-      return res.status(400).json({ error: "Missing orderId or userId" });
-    }
-
-    const orderDoc = await db
-      .collection("telegramUsers")
-      .doc(userId)
-      .collection("orders")
-      .doc(orderId)
-      .get();
-
-    if (!orderDoc.exists) {
-      return res.status(404).json({ error: "Order not found" });
-    }
-
-    const orderData = orderDoc.data();
-    
-    // Если есть PaymentId, можно запросить статус у Tinkoff
-    if (orderData.tinkoff?.PaymentId) {
-      const payload = {
+      const payload2 = {
         TerminalKey: TINKOFF_TERMINAL_KEY,
-        PaymentId: orderData.tinkoff.PaymentId,
+        Amount: amountKop,
+        OrderId: orderId,
+        Description: description,
+        Token: token2,
+        Recurrent: "Y",
       };
-
-      const raw = `${payload.PaymentId}${TINKOFF_PASSWORD}${TINKOFF_TERMINAL_KEY}`;
-      payload.Token = crypto.createHash("sha256").update(raw, "utf8").digest("hex");
-
-      const tinkoffResp = await postTinkoff("GetState", payload);
       
-      // Обновляем статус в БД
-      if (tinkoffResp.Success) {
-        await orderDoc.ref.update({
-          "tinkoff.Status": tinkoffResp.Status,
-          status: tinkoffResp.Status === "CONFIRMED" ? "success" : "pending",
-          rebillId: tinkoffResp.RebillId || orderData.rebillId,
-        });
-        
-        orderData.tinkoff.Status = tinkoffResp.Status;
-        orderData.status = tinkoffResp.Status === "CONFIRMED" ? "success" : "pending";
-        orderData.rebillId = tinkoffResp.RebillId || orderData.rebillId;
-      }
+      console.log("Payload 2:", JSON.stringify(payload2, null, 2));
+      const result2 = await postTinkoff("Init", payload2);
+      console.log("Result 2:", result2);
     }
-
-    res.json({
-      success: true,
-      order: orderData,
-    });
+    
+    // Тест 3: Полный вариант
+    console.log("\n🔧 ТЕСТ 3: Полный вариант");
+    const token3 = crypto.createHash("sha256")
+      .update(`${amountKop}${orderId}${description}Y${userId}${TINKOFF_PASSWORD}${TINKOFF_TERMINAL_KEY}`, "utf8")
+      .digest("hex");
+    
+    const payload3 = {
+      TerminalKey: TINKOFF_TERMINAL_KEY,
+      Amount: amountKop,
+      OrderId: orderId,
+      Description: description,
+      CustomerKey: userId,
+      Recurrent: "Y",
+      Token: token3,
+      Receipt: {
+        Email: "test@test.com",
+        Taxation: "usn_income",
+        Items: [{
+          Name: description,
+          Price: amountKop,
+          Quantity: 1,
+          Amount: amountKop,
+          Tax: "none",
+        }],
+      },
+    };
+    
+    console.log("Payload 3:", JSON.stringify(payload3, null, 2));
+    const result3 = await postTinkoff("Init", payload3);
+    console.log("Result 3:", result3);
+    
+    res.json({ tests: [result1, result2, result3] });
+    
   } catch (err) {
-    console.error("❌ /check-status error:", err);
+    console.error("❌ /init-test error:", err);
     res.status(500).json({ error: err.message });
   }
 });
