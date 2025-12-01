@@ -139,19 +139,20 @@ router.post("/init", async (req, res) => {
     };
 
     // Создаём payload БЕЗ Token
-    const payload = {
-      TerminalKey: TINKOFF_TERMINAL_KEY,
-      Amount: amountKop,
-      OrderId: orderId,
-      Description: description,
-      CustomerKey: userId,
-      Recurrent: "1",
-      Language: "ru",
-      Receipt: receiptObject,
-    };
+const payload = {
+  TerminalKey: TINKOFF_TERMINAL_KEY,
+  Amount: amountKop,
+  OrderId: orderId,
+  Description: description,
+  CustomerKey: userId,
+  Recurrent: "1",
+  Language: "ru",
+  Receipt: JSON.stringify(receiptObject), // <-- СТРОКА, а не объект
+};
 
-    // Генерируем токен
-    payload.Token = generateTinkoffInitToken(payload);
+// Генерируем токен
+payload.Token = generateTinkoffInitToken(payload);
+
 
     const data = await postTinkoff("Init", payload);
     if (!data.Success) return res.status(400).json(data);
