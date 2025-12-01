@@ -306,4 +306,76 @@ router.post("/debug-payment", async (req, res) => {
   }
 });
 
+// === Обработчик вебхука от Tinkoff ===
+router.post("/webhook", async (req, res) => {
+  try {
+    const notification = req.body;
+    console.log("📨 Tinkoff Webhook received:", notification);
+
+    // Проверяем подпись (опционально, но рекомендуется)
+    // const token = generateWebhookToken(notification);
+    // if (token !== notification.Token) {
+    //   return res.status(401).json({ error: "Invalid signature" });
+    // }
+
+    // Проверяем успешность платежа
+    if (notification.Success && notification.Status === "CONFIRMED") {
+      const { OrderId, PaymentId, RebillId, CustomerKey } = notification;
+      
+      console.log("✅ Payment confirmed! RebillId:", RebillId);
+      
+      if (RebillId) {
+        // Сохраняем RebillId в Firestore
+        await db
+          .collection("telegramUsers")
+          .doc(CustomerKey)
+          .collection("orders")
+          .doc(OrderId)
+          .update({
+            rebillId: RebillId,
+            tinkoffNotification: notification,
+            notifiedAt: admin.firestore.FieldValue.serverTimestamp(),
+          });
+        
+        console.log(`💾 RebillId ${RebillId} saved for order ${OrderId}`);
+      }
+      
+      // Тут можно добавить логику для отправки уведомлений пользователю
+      // или обновления баланса
+    }
+
+    // Всегда возвращаем успешный ответ Tinkoff
+    res.json({ Success: true });
+    
+  } catch (err) {
+    console.error("❌ Webhook error:", err);
+    // Все равно возвращаем успех, чтобы Tinkoff не отправлял повторно
+    res.json({ Success: true });
+  }
+});
+
+// === Генерация токена для вебхука (для проверки подписи) ===
+function generateWebhookToken(notification) {
+  // Для вебхука Tinkoff отправляет токен, сгенерированный из:
+  // Amount + OrderId + Password + PaymentId + Status + TerminalKey
+  const params = [
+    { key: "Amount", value: notification.Amount.toString() },
+    { key: "OrderId", value: notification.OrderId },
+    { key: "Password", value: TINKOFF_PASSWORD },
+    { key: "PaymentId", value: notification.PaymentId },
+    { key: "Status", value: notification.Status },
+    { key: "TerminalKey", value: notification.TerminalKey }
+  ];
+  
+  // Если есть дополнительные поля
+  if (notification.RebillId) {
+    params.push({ key: "RebillId", value: notification.RebillId });
+  }
+  
+  params.sort((a, b) => a.key.localeCompare(b.key));
+  const raw = params.map(p => p.value).join("");
+  
+  return crypto.createHash("sha256").update(raw, "utf8").digest("hex");
+}
+
 export default router;
