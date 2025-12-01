@@ -93,28 +93,6 @@ async function postTinkoff(method, payload) {
 // === Init платежа ===
 router.post("/init", async (req, res) => {
   try {
-    const { amount, userId, description, recurrent = "Y" } = req.body; // Добавлен recurrent с дефолтным значением "Y"
-
-    if (!amount || !userId || !description) {
-      return res.status(400).json({ error: "Missing amount, userId, description" });
-    }
-
-    const amountKop = Math.round(amount * 100);
-    const orderId = `ORD-${Date.now()}-${Math.floor(Math.random() * 9000 + 1000)}`.slice(0, 36);
-
-    const token = generateTinkoffTokenInit({
-      Amount: amountKop,
-      CustomerKey: userId,
-      Description: description,
-      OrderId: orderId,
-      RebillId: "", // пусто для новой рекуррентной операции
-      Recurrent: recurrent, // добавлен в генерацию токена
-    });
-
-    // Важно: порядок полей должен соответствовать примеру из документации
-// === Init платежа ===
-router.post("/init", async (req, res) => {
-  try {
     const { amount, userId, description, recurrent = "Y" } = req.body;
 
     if (!amount || !userId || !description) {
@@ -141,7 +119,7 @@ router.post("/init", async (req, res) => {
       Token: token,
       Description: description,
       CustomerKey: userId,
-      Recurrent: "Y", // ← ИСПРАВЛЕНО: должно быть строкой "Y", а не Y
+      Recurrent: recurrent, // Используем значение из запроса (по умолчанию "Y")
       Receipt: {
         Email: "test@example.com",
         Taxation: "usn_income",
@@ -173,40 +151,7 @@ router.post("/init", async (req, res) => {
         description,
         tinkoff: { PaymentId: data.PaymentId, PaymentURL: data.PaymentURL },
         rebillId: null,
-        recurrent: "Y", // ← Здесь тоже строка
-        createdAt: admin.firestore.FieldValue.serverTimestamp(),
-      });
-
-    res.json({
-      PaymentURL: data.PaymentURL,
-      PaymentId: data.PaymentId,
-      orderId,
-      rebillId: null,
-      recurrent: "Y",
-    });
-  } catch (err) {
-    console.error("❌ /init error:", err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-    const data = await postTinkoff("Init", payload);
-    if (!data.Success) return res.status(400).json(data);
-
-    // Сохраняем заказ в Firestore
-    await db
-      .collection("telegramUsers")
-      .doc(userId)
-      .collection("orders")
-      .doc(orderId)
-      .set({
-        orderId,
-        amountKop,
-        currency: "RUB",
-        description,
-        tinkoff: { PaymentId: data.PaymentId, PaymentURL: data.PaymentURL },
-        rebillId: null, // пока нет RebillId
-        recurrent: recurrent, // сохраняем флаг рекуррента
+        recurrent: recurrent,
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
       });
 
