@@ -223,4 +223,25 @@ router.post("/finish-authorize", async (req, res) => {
   }
 });
 
+// === Проверка состояния платежа и получение RebillId ===
+router.post("/check-payment", async (req, res) => {
+  try {
+    const { paymentId } = req.body;
+    if (!paymentId) {
+      return res.status(400).json({ error: "Missing paymentId" });
+    }
+
+    const rebillId = await getTinkoffState(paymentId);
+    
+    res.json({
+      paymentId,
+      rebillId,
+      hasRebill: !!rebillId
+    });
+  } catch (err) {
+    console.error("❌ /check-payment error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 export default router;
