@@ -12,7 +12,7 @@ const TINKOFF_PASSWORD = "rlkzhollw74x8uvv";
 const TINKOFF_API_URL = "https://securepay.tinkoff.ru/v2";
 
 // === Генерация токена Init ===
-function generateTinkoffTokenInit({ Amount, CustomerKey, Description, OrderId, RebillId, Recurrent }) {
+function generateTinkoffTokenInit({ Amount, CustomerKey, Description, OrderId, RebillId, Recurrent, PayType }) {
   // Важно: параметры должны быть в алфавитном порядке
   const params = [
     { key: "Amount", value: Amount.toString() },
@@ -28,9 +28,14 @@ function generateTinkoffTokenInit({ Amount, CustomerKey, Description, OrderId, R
     params.push({ key: "RebillId", value: RebillId });
   }
   
-  // Добавляем Recurrent, если он есть (для генерации токена)
+  // Добавляем Recurrent, если он есть
   if (Recurrent && Recurrent.trim() !== "") {
     params.push({ key: "Recurrent", value: Recurrent });
+  }
+  
+  // Добавляем PayType, если он есть
+  if (PayType && PayType.trim() !== "") {
+    params.push({ key: "PayType", value: PayType });
   }
   
   // Сортируем по алфавиту по ключу
@@ -109,6 +114,7 @@ router.post("/init", async (req, res) => {
       OrderId: orderId,
       RebillId: "", // пусто для новой рекуррентной операции
       Recurrent: recurrent,
+      PayType: "O", // добавлен в генерацию токена
     });
 
     // Важно: порядок полей должен соответствовать примеру из документации
@@ -119,7 +125,9 @@ router.post("/init", async (req, res) => {
       Token: token,
       Description: description,
       CustomerKey: userId,
-      Recurrent: recurrent, // Используем значение из запроса (по умолчанию "Y")
+      Recurrent: recurrent,
+      PayType: "O", // One-click оплата (обязательно для рекуррента)
+      Language: "ru",
       Receipt: {
         Email: "test@example.com",
         Taxation: "usn_income",
@@ -152,6 +160,7 @@ router.post("/init", async (req, res) => {
         tinkoff: { PaymentId: data.PaymentId, PaymentURL: data.PaymentURL },
         rebillId: null,
         recurrent: recurrent,
+        payType: "O",
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
       });
 
@@ -237,6 +246,43 @@ router.post("/check-payment", async (req, res) => {
     });
   } catch (err) {
     console.error("❌ /check-payment error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// === Полная проверка платежа ===
+router.post("/debug-payment", async (req, res) => {
+  try {
+    const { paymentId } = req.body;
+    
+    const payload = {
+      TerminalKey: TINKOFF_TERMINAL_KEY,
+      PaymentId: paymentId,
+    };
+
+    const raw = `${payload.PaymentId}${TINKOFF_PASSWORD}${TINKOFF_TERMINAL_KEY}`;
+    payload.Token = crypto.createHash("sha256").update(raw, "utf8").digest("hex");
+
+    const resp = await fetch(`${TINKOFF_API_URL}/GetState`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+
+    const data = await resp.json();
+    
+    res.json({
+      paymentId,
+      status: data.Status,
+      success: data.Success,
+      errorCode: data.ErrorCode,
+      errorMessage: data.Message,
+      rebillId: data.RebillId || data.PaymentData?.RebillId,
+      cardId: data.CardId,
+      pan: data.Pan,
+      fullResponse: data
+    });
+  } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
