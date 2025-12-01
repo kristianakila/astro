@@ -147,7 +147,7 @@ const payload = {
   CustomerKey: userId,
   Recurrent: "1",
   Language: "ru",
-  Receipt: JSON.stringify(receiptObject), // <-- СТРОКА, а не объект
+  Receipt: receiptObject, // <-- ОБЪЕКТ, не строка
 };
 
 // Генерируем токен
