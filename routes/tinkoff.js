@@ -11,16 +11,20 @@ const TINKOFF_TERMINAL_KEY = "1691507148627";
 const TINKOFF_PASSWORD = "rlkzhollw74x8uvv";
 const TINKOFF_API_URL = "https://securepay.tinkoff.ru/v2";
 
-// === Генерация токена Init ===
-function generateTinkoffTokenInit({ Amount, CustomerKey, Description, OrderId, RebillId }) {
-  const raw = `${Amount}${CustomerKey}${Description}${OrderId}${RebillId || ""}${TINKOFF_PASSWORD}${TINKOFF_TERMINAL_KEY}`;
+// === Генерация токена Init (СТРОГО В ТАКОМ ПОРЯДКЕ) ===
+function generateTinkoffTokenInit({ Amount, OrderId, Description, Recurrent, CustomerKey }) {
+  // Важно: порядок параметров для токена должен совпадать с документацией
+  // В документации: TerminalKey + Amount + OrderId + Description + Recurrent + CustomerKey + Token
+  // Но для генерации токена: Amount + OrderId + Description + Recurrent + CustomerKey + Password + TerminalKey
+  const raw = `${Amount}${OrderId}${Description}${Recurrent}${CustomerKey}${TINKOFF_PASSWORD}${TINKOFF_TERMINAL_KEY}`;
   console.log("🔐 Token Init RAW:", raw);
+  console.log("🔐 Token Init params:", { Amount, OrderId, Description, Recurrent, CustomerKey });
   return crypto.createHash("sha256").update(raw, "utf8").digest("hex");
 }
 
 // === Генерация токена Finish ===
-function generateTinkoffTokenFinish({ Amount, CustomerKey, Description, OrderId, PaymentId }) {
-  const raw = `${Amount}${CustomerKey}${Description}${OrderId}${PaymentId}${TINKOFF_PASSWORD}${TINKOFF_TERMINAL_KEY}`;
+function generateTinkoffTokenFinish({ Amount, OrderId, Description, PaymentId }) {
+  const raw = `${Amount}${OrderId}${Description}${PaymentId}${TINKOFF_PASSWORD}${TINKOFF_TERMINAL_KEY}`;
   console.log("🔐 Token Finish RAW:", raw);
   return crypto.createHash("sha256").update(raw, "utf8").digest("hex");
 }
@@ -45,13 +49,12 @@ async function getTinkoffState(paymentId) {
   const data = await resp.json();
   console.log("📥 Tinkoff GetState response:", data);
 
-  // RebillId вернётся только если карта привязана для рекуррентного платежа
-  return data.PaymentData?.RebillId || null;
+  return data.RebillId || data.PaymentData?.RebillId || null;
 }
 
 // === POST к Tinkoff API ===
 async function postTinkoff(method, payload) {
-  console.log(`📤 Tinkoff request: ${method}`, payload);
+  console.log(`📤 Tinkoff request: ${method}`, JSON.stringify(payload, null, 2));
 
   const resp = await fetch(`${TINKOFF_API_URL}/${method}`, {
     method: "POST",
@@ -68,7 +71,7 @@ async function postTinkoff(method, payload) {
 // === Init платежа ===
 router.post("/init", async (req, res) => {
   try {
-    const { amount, userId, description } = req.body;
+    const { amount, userId, description, email = "test@example.com", phone = "" } = req.body;
 
     if (!amount || !userId || !description) {
       return res.status(400).json({ error: "Missing amount, userId, description" });
@@ -76,47 +79,63 @@ router.post("/init", async (req, res) => {
 
     const amountKop = Math.round(amount * 100);
     const orderId = `ORD-${Date.now()}-${Math.floor(Math.random() * 9000 + 1000)}`.slice(0, 36);
+    
+    // Для рекуррентного платежа
+    const recurrent = "Y";
+    const customerKey = userId.toString();
 
+    // Генерация токена в правильном порядке
     const token = generateTinkoffTokenInit({
       Amount: amountKop,
-      CustomerKey: userId,
-      Description: description,
       OrderId: orderId,
-      RebillId: "", // пусто для новой рекуррентной операции
+      Description: description,
+      Recurrent: recurrent,
+      CustomerKey: customerKey,
     });
 
-    // Payload с РЕКУРРЕНТОМ и в строгом порядке как в документации
+    // Payload СТРОГО в порядке из документации
     const payload = {
       TerminalKey: TINKOFF_TERMINAL_KEY,
       Amount: amountKop,
       OrderId: orderId,
       Token: token,
       Description: description,
-      CustomerKey: userId,
-      Recurrent: "Y", // Добавлен рекуррент для сохранения карты
-      PayType: "O", // Допустим одностадийная оплата
+      CustomerKey: customerKey,
+      Recurrent: recurrent,
+      PayType: "O",
       Language: "ru",
-      NotificationURL: "", // Укажите ваш URL для уведомлений если нужно
-      SuccessURL: "", // Укажите URL при успешной оплате
-      FailURL: "", // Укажите URL при ошибке оплаты
+      NotificationURL: "https://astro-1-nns5.onrender.com/api/notification",
+      SuccessURL: "https://astro-1-nns5.onrender.com/success",
+      FailURL: "https://astro-1-nns5.onrender.com/fail",
       Receipt: {
+        Email: email,
+        Phone: phone,
+        Taxation: "usn_income",
         Items: [
           {
-            Name: description,
+            Name: description.substring(0, 128), // Максимум 128 символов
             Price: amountKop,
-            Quantity: 1,
+            Quantity: 1.00,
             Amount: amountKop,
+            PaymentMethod: "full_payment",
+            PaymentObject: "service",
             Tax: "none",
           },
         ],
-        Email: "test@example.com",
-        Phone: "", // Можно добавить телефон
-        Taxation: "usn_income",
       },
     };
 
+    console.log("📤 Sending payload to Tinkoff:", JSON.stringify(payload, null, 2));
+
     const data = await postTinkoff("Init", payload);
-    if (!data.Success) return res.status(400).json(data);
+    
+    if (!data.Success) {
+      console.error("❌ Tinkoff error:", data);
+      return res.status(400).json({
+        error: "Tinkoff API error",
+        details: data,
+      });
+    }
 
     // Сохраняем заказ в Firestore
     await db
@@ -127,24 +146,38 @@ router.post("/init", async (req, res) => {
       .set({
         orderId,
         amountKop,
+        amount: amount,
         currency: "RUB",
         description,
-        tinkoff: { PaymentId: data.PaymentId, PaymentURL: data.PaymentURL },
-        rebillId: null, // пока нет RebillId
-        isRecurrent: true, // Отмечаем что это рекуррентный платеж
+        userId,
+        email,
+        phone,
+        tinkoff: { 
+          PaymentId: data.PaymentId, 
+          PaymentURL: data.PaymentURL,
+          Status: data.Status 
+        },
+        rebillId: null,
+        isRecurrent: true,
+        status: "created",
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
       });
 
     res.json({
+      success: true,
       PaymentURL: data.PaymentURL,
       PaymentId: data.PaymentId,
       orderId,
       rebillId: null,
       isRecurrent: true,
+      status: data.Status,
     });
   } catch (err) {
     console.error("❌ /init error:", err);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ 
+      error: err.message,
+      stack: err.stack 
+    });
   }
 });
 
@@ -160,9 +193,8 @@ router.post("/finish-authorize", async (req, res) => {
 
     const token = generateTinkoffTokenFinish({
       Amount: amountKop,
-      CustomerKey: userId,
-      Description: description,
       OrderId: orderId,
+      Description: description,
       PaymentId: paymentId,
     });
 
@@ -188,74 +220,124 @@ router.post("/finish-authorize", async (req, res) => {
       .collection("orders")
       .doc(orderId)
       .update({
-        tinkoff: { ...data },
+        "tinkoff.Status": data.Status,
+        "tinkoff.Response": data,
         rebillId,
-        isRecurrent: !!rebillId, // Если есть rebillId, значит карта сохранена
+        isRecurrent: !!rebillId,
+        status: data.Status === "CONFIRMED" ? "success" : "pending",
         finishedAt: admin.firestore.FieldValue.serverTimestamp(),
       });
 
-    res.json({ ...data, rebillId, isRecurrent: !!rebillId });
+    res.json({ 
+      success: data.Success,
+      status: data.Status,
+      rebillId,
+      isRecurrent: !!rebillId,
+      message: data.Message 
+    });
   } catch (err) {
     console.error("❌ /finish-authorize error:", err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// === Выполнение рекуррентного платежа (для последующих списаний) ===
-router.post("/charge-recurrent", async (req, res) => {
+// === Уведомления от Tinkoff ===
+router.post("/notification", async (req, res) => {
   try {
-    const { userId, orderId, amount, description, rebillId } = req.body;
-    
-    if (!userId || !orderId || !amount || !description || !rebillId) {
-      return res.status(400).json({ error: "Missing params" });
+    const notification = req.body;
+    console.log("📨 Tinkoff notification received:", notification);
+
+    // Проверяем токен уведомления
+    const tokenData = `${notification.TerminalKey}${notification.OrderId}${notification.Success}${notification.Status}${notification.PaymentId}${notification.Amount}${TINKOFF_PASSWORD}`;
+    const expectedToken = crypto.createHash("sha256").update(tokenData, "utf8").digest("hex");
+
+    if (notification.Token !== expectedToken) {
+      console.error("❌ Invalid notification token");
+      return res.status(400).json({ error: "Invalid token" });
     }
 
-    const amountKop = Math.round(amount * 100);
-    const newOrderId = `REC-${Date.now()}-${Math.floor(Math.random() * 9000 + 1000)}`.slice(0, 36);
+    // Ищем заказ по OrderId
+    const ordersSnapshot = await db
+      .collectionGroup("orders")
+      .where("orderId", "==", notification.OrderId)
+      .get();
 
-    // Токен для рекуррентного платежа
-    const raw = `${amountKop}${description}${newOrderId}${TINKOFF_PASSWORD}${rebillId}${TINKOFF_TERMINAL_KEY}`;
-    const token = crypto.createHash("sha256").update(raw, "utf8").digest("hex");
+    if (!ordersSnapshot.empty) {
+      const orderDoc = ordersSnapshot.docs[0];
+      const orderData = orderDoc.data();
+      
+      await orderDoc.ref.update({
+        "tinkoff.notification": notification,
+        status: notification.Success ? "success" : "failed",
+        rebillId: notification.RebillId || notification.PaymentData?.RebillId || orderData.rebillId,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
 
-    const payload = {
-      TerminalKey: TINKOFF_TERMINAL_KEY,
-      Amount: amountKop,
-      OrderId: newOrderId,
-      Token: token,
-      Description: description,
-      RebillId: rebillId, // Используем сохраненный RebillId
-    };
+      console.log(`✅ Order ${notification.OrderId} updated with notification`);
+    }
 
-    const data = await postTinkoff("Init", payload);
-    if (!data.Success) return res.status(400).json(data);
+    // Всегда возвращаем OK Tinkoff
+    res.json({ success: true });
+  } catch (err) {
+    console.error("❌ /notification error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
 
-    // Сохраняем рекуррентный платеж в Firestore
-    await db
+// === Проверка статуса платежа ===
+router.post("/check-status", async (req, res) => {
+  try {
+    const { orderId, userId } = req.body;
+    
+    if (!orderId || !userId) {
+      return res.status(400).json({ error: "Missing orderId or userId" });
+    }
+
+    const orderDoc = await db
       .collection("telegramUsers")
       .doc(userId)
       .collection("orders")
-      .doc(newOrderId)
-      .set({
-        orderId: newOrderId,
-        amountKop,
-        currency: "RUB",
-        description,
-        tinkoff: { PaymentId: data.PaymentId },
-        rebillId,
-        isRecurrent: true,
-        isRecurrentCharge: true, // Отмечаем что это рекуррентное списание
-        parentOrderId: orderId, // ID первоначального заказа
-        createdAt: admin.firestore.FieldValue.serverTimestamp(),
-      });
+      .doc(orderId)
+      .get();
+
+    if (!orderDoc.exists) {
+      return res.status(404).json({ error: "Order not found" });
+    }
+
+    const orderData = orderDoc.data();
+    
+    // Если есть PaymentId, можно запросить статус у Tinkoff
+    if (orderData.tinkoff?.PaymentId) {
+      const payload = {
+        TerminalKey: TINKOFF_TERMINAL_KEY,
+        PaymentId: orderData.tinkoff.PaymentId,
+      };
+
+      const raw = `${payload.PaymentId}${TINKOFF_PASSWORD}${TINKOFF_TERMINAL_KEY}`;
+      payload.Token = crypto.createHash("sha256").update(raw, "utf8").digest("hex");
+
+      const tinkoffResp = await postTinkoff("GetState", payload);
+      
+      // Обновляем статус в БД
+      if (tinkoffResp.Success) {
+        await orderDoc.ref.update({
+          "tinkoff.Status": tinkoffResp.Status,
+          status: tinkoffResp.Status === "CONFIRMED" ? "success" : "pending",
+          rebillId: tinkoffResp.RebillId || orderData.rebillId,
+        });
+        
+        orderData.tinkoff.Status = tinkoffResp.Status;
+        orderData.status = tinkoffResp.Status === "CONFIRMED" ? "success" : "pending";
+        orderData.rebillId = tinkoffResp.RebillId || orderData.rebillId;
+      }
+    }
 
     res.json({
-      PaymentId: data.PaymentId,
-      orderId: newOrderId,
-      rebillId,
-      isRecurrent: true,
+      success: true,
+      order: orderData,
     });
   } catch (err) {
-    console.error("❌ /charge-recurrent error:", err);
+    console.error("❌ /check-status error:", err);
     res.status(500).json({ error: err.message });
   }
 });
