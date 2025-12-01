@@ -11,44 +11,45 @@ const TINKOFF_TERMINAL_KEY = "1691507148627";
 const TINKOFF_PASSWORD = "rlkzhollw74x8uvv";
 const TINKOFF_API_URL = "https://securepay.tinkoff.ru/v2";
 
-// === Генерация токена для рекуррентной ссылки ===
-function generateRecurrentToken({
-  amount,
-  description,
-  recurrent,
-  receipt,
-  phone,
-  email,
-  expired,
-  taxation,
-  language,
-  extra_params,
-}) {
-  const raw =
-    `${amount}` +
-    `${description}` +
-    `${recurrent}` +
-    `${receipt}` +
-    `${phone}` +
-    `${email}` +
-    `${expired}` +
-    `${taxation}` +
-    `${language}` +
-    `${extra_params}` +
-    `${TINKOFF_PASSWORD}`;
 
-  console.log("🔐 Recurrent Token RAW:", raw);
+// === Генерация токена: сортировка параметров по алфавиту по именам ключей ===
+function generateTokenAlphabetical(params = {}, { appendTerminalKey = false } = {}) {
+  // Преобразуем значения в строки и удалим undefined/null
+  const kv = Object.entries(params)
+    .filter(([k, v]) => v !== undefined && v !== null)
+    .map(([k, v]) => [k, String(v)]);
+
+  // Сортируем по имени ключа в лексикографическом (алфавитном) порядке
+  kv.sort((a, b) => a[0].localeCompare(b[0], "en"));
+
+  // Конкатенируем только значения (в порядке отсортированных ключей)
+  const concatenated = kv.map(([, v]) => v).join("");
+
+  // В конце — пароль, и при необходимости TerminalKey
+  const raw = concatenated + TINKOFF_PASSWORD + (appendTerminalKey ? TINKOFF_TERMINAL_KEY : "");
+
+  console.log("🔐 Token Alphabetical RAW:", { order: kv.map(([k]) => k), rawPreview: raw.slice(0, 200) });
 
   return crypto.createHash("sha256").update(raw, "utf8").digest("hex");
 }
+
+// === Обёртка для рекуррентного токена ===
+function generateRecurrentToken(params) {
+  // В params передаём: amount, description, recurrent, receipt, phone, email, expired, taxation, language, extra_params
+  // Функция сама отсортирует поля по алфавиту и создаст SHA256(raw + password)
+  return generateTokenAlphabetical(params, { appendTerminalKey: false });
+}
+
 
 // === Генерация токена FinishAuthorize ===
-function generateTinkoffTokenFinish({ Amount, CustomerKey, Description, OrderId, PaymentId }) {
-  const raw =
-    `${Amount}${CustomerKey}${Description}${OrderId}${PaymentId}${TINKOFF_PASSWORD}${TINKOFF_TERMINAL_KEY}`;
-  console.log("🔐 Token Finish RAW:", raw);
-  return crypto.createHash("sha256").update(raw, "utf8").digest("hex");
+// === Генерация токена FinishAuthorize (с алфавитной сортировкой) ===
+function generateTinkoffTokenFinish(params) {
+  // Тinkoff требует в некоторых методах TerminalKey в raw — поэтому appendTerminalKey = true
+  // params ожидает поля: Amount, CustomerKey, Description, OrderId, PaymentId
+  // Мы сортируем имена полей по алфавиту и конкатенируем значения в этом порядке, затем добавляем пароль + TerminalKey
+  return generateTokenAlphabetical(params, { appendTerminalKey: true });
 }
+
 
 // === Получение RebillId через GetState ===
 async function getTinkoffState(paymentId) {
