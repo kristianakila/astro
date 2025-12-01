@@ -120,7 +120,7 @@ router.post("/init", async (req, res) => {
       Description: description,
       CustomerKey: userId,
       Recurrent: recurrent, // Добавлен параметр рекуррента (после CustomerKey, перед PayType)
-      // PayType: "O", // Можно добавить при необходимости
+      PayType: "O", // Можно добавить при необходимости
       // Language: "ru", // Можно добавить при необходимости
       Receipt: {
         Email: "test@example.com",
