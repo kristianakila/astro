@@ -12,30 +12,26 @@ const TINKOFF_PASSWORD = "rlkzhollw74x8uvv";
 const TINKOFF_API_URL = "https://securepay.tinkoff.ru/v2";
 
 // ============================================================
-// === Универсальный генератор токена для Tinkoff Init ===
+// === Генерация токена Init ===
 // ============================================================
 function generateTinkoffInitToken(payload) {
   const prepared = {};
 
-  // Сначала преобразуем все поля для подписи
   for (const [key, value] of Object.entries(payload)) {
     if (value === undefined || value === null) continue;
 
-    // Receipt должен быть JSON-строкой
     if (key === "Receipt") {
+      // Для подписи сериализуем Receipt в JSON
       prepared[key] = JSON.stringify(value);
     } else {
       prepared[key] = String(value);
     }
   }
 
-  // Сортировка ключей строго по алфавиту (ASCII)
   const sortedKeys = Object.keys(prepared).sort();
 
   // Формируем строку: key=valuekey=value...
-  const signature = sortedKeys
-    .map((k) => `${k}=${prepared[k]}`)
-    .join("");
+  const signature = sortedKeys.map((k) => `${k}=${prepared[k]}`).join("");
 
   const raw = signature + TINKOFF_PASSWORD;
 
@@ -61,7 +57,9 @@ function generateTinkoffTokenFinish({ Amount, CustomerKey, Description, OrderId,
   return crypto.createHash("sha256").update(raw, "utf8").digest("hex");
 }
 
+// ============================================================
 // === Получение RebillId через GetState ===
+// ============================================================
 async function getTinkoffState(paymentId) {
   const payload = {
     TerminalKey: TINKOFF_TERMINAL_KEY,
@@ -83,7 +81,9 @@ async function getTinkoffState(paymentId) {
   return data.PaymentData?.RebillId || null;
 }
 
+// ============================================================
 // === POST к Tinkoff API ===
+// ============================================================
 async function postTinkoff(method, payload) {
   console.log(`📤 Tinkoff request: ${method}`, payload);
 
@@ -102,26 +102,21 @@ async function postTinkoff(method, payload) {
 // ============================================================
 // === Init рекуррентного платежа ===
 // ============================================================
-
 router.post("/init", async (req, res) => {
   try {
     const { priceNextMonth, discount, userId, phone, email } = req.body;
 
     if (!priceNextMonth || discount === undefined || !userId) {
-      return res.status(400).json({
-        error: "Missing priceNextMonth, discount, userId",
-      });
+      return res.status(400).json({ error: "Missing priceNextMonth, discount, userId" });
     }
 
-    // Цена со скидкой
     const finalAmount = parseInt(priceNextMonth * (1 - discount / 100));
     const amountKop = finalAmount * 100;
 
     const orderId = `ORD-${Date.now()}-${Math.floor(Math.random() * 9000 + 1000)}`.slice(0, 36);
-
     const description = `Доступ к астро-асистенту [${priceNextMonth}р./мес.]`;
 
-    // === Receipt ===
+    // === Receipt без лишних полей ===
     const receiptObject = {
       Email: email || "",
       Phone: phone || "",
@@ -133,31 +128,28 @@ router.post("/init", async (req, res) => {
           Quantity: 1,
           Amount: amountKop,
           Tax: "none",
-          PaymentObject: "service",
         },
       ],
     };
 
-    // Создаём payload БЕЗ Token
-const payload = {
-  TerminalKey: TINKOFF_TERMINAL_KEY,
-  Amount: amountKop,
-  OrderId: orderId,
-  Description: description,
-  CustomerKey: userId,
-  Recurrent: "1",
-  Language: "ru",
-  Receipt: receiptObject, // <-- ОБЪЕКТ, не строка
-};
+    const payload = {
+      TerminalKey: TINKOFF_TERMINAL_KEY,
+      Amount: amountKop,
+      OrderId: orderId,
+      Description: description,
+      CustomerKey: userId,
+      Recurrent: "1",
+      Language: "ru",
+      Receipt: receiptObject,
+    };
 
-// Генерируем токен
-payload.Token = generateTinkoffInitToken(payload);
-
+    // Токен для Init
+    payload.Token = generateTinkoffInitToken({ ...payload, Receipt: JSON.stringify(receiptObject) });
 
     const data = await postTinkoff("Init", payload);
     if (!data.Success) return res.status(400).json(data);
 
-    // Сохраняем заказ
+    // Сохраняем заказ в Firestore
     await db
       .collection("telegramUsers")
       .doc(userId)
@@ -188,13 +180,11 @@ payload.Token = generateTinkoffInitToken(payload);
 });
 
 // ============================================================
-// === FinishAuthorize — получение RebillId ===
+// === FinishAuthorize (получение RebillId) ===
 // ============================================================
-
 router.post("/finish-authorize", async (req, res) => {
   try {
     const { userId, orderId, paymentId, amount, description } = req.body;
-
     if (!userId || !orderId || !paymentId || !amount || !description) {
       return res.status(400).json({ error: "Missing params" });
     }
