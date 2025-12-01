@@ -12,7 +12,7 @@ const TINKOFF_PASSWORD = "rlkzhollw74x8uvv";
 const TINKOFF_API_URL = "https://securepay.tinkoff.ru/v2";
 
 // === Генерация токена Init ===
-function generateTinkoffTokenInit({ Amount, CustomerKey, Description, OrderId, RebillId, Recurrent, PayType }) {
+function generateTinkoffTokenInit({ Amount, CustomerKey, Description, OrderId, RebillId, Recurrent, PayType, Language }) {
   // Важно: параметры должны быть в алфавитном порядке
   const params = [
     { key: "Amount", value: Amount.toString() },
@@ -38,6 +38,11 @@ function generateTinkoffTokenInit({ Amount, CustomerKey, Description, OrderId, R
     params.push({ key: "PayType", value: PayType });
   }
   
+  // Добавляем Language, если он есть
+  if (Language && Language.trim() !== "") {
+    params.push({ key: "Language", value: Language });
+  }
+  
   // Сортируем по алфавиту по ключу
   params.sort((a, b) => a.key.localeCompare(b.key));
   
@@ -48,10 +53,25 @@ function generateTinkoffTokenInit({ Amount, CustomerKey, Description, OrderId, R
   return crypto.createHash("sha256").update(raw, "utf8").digest("hex");
 }
 
-// === Генерация токена Finish ===
-function generateTinkoffTokenFinish({ Amount, CustomerKey, Description, OrderId, PaymentId }) {
-  const raw = `${Amount}${CustomerKey}${Description}${OrderId}${PaymentId}${TINKOFF_PASSWORD}${TINKOFF_TERMINAL_KEY}`;
-  console.log("🔐 Token Finish RAW:", raw);
+// === Генерация токена FinishAuthorize ===
+function generateTinkoffTokenFinish({ Amount, OrderId, PaymentId }) {
+  // Для FinishAuthorize токен генерируется только из:
+  // Amount + OrderId + Password + PaymentId + TerminalKey
+  const params = [
+    { key: "Amount", value: Amount.toString() },
+    { key: "OrderId", value: OrderId },
+    { key: "Password", value: TINKOFF_PASSWORD },
+    { key: "PaymentId", value: PaymentId },
+    { key: "TerminalKey", value: TINKOFF_TERMINAL_KEY }
+  ];
+  
+  // Сортируем по алфавиту по ключу
+  params.sort((a, b) => a.key.localeCompare(b.key));
+  
+  // Конкатенируем значения
+  const raw = params.map(p => p.value).join("");
+  console.log("🔐 Token FinishAuthorize RAW:", raw);
+  
   return crypto.createHash("sha256").update(raw, "utf8").digest("hex");
 }
 
@@ -62,7 +82,7 @@ async function getTinkoffState(paymentId) {
     PaymentId: paymentId,
   };
 
-  // Токен для GetState
+  // Токен для GetState: PaymentId + Password + TerminalKey
   const raw = `${payload.PaymentId}${TINKOFF_PASSWORD}${TINKOFF_TERMINAL_KEY}`;
   payload.Token = crypto.createHash("sha256").update(raw, "utf8").digest("hex");
 
@@ -114,7 +134,8 @@ router.post("/init", async (req, res) => {
       OrderId: orderId,
       RebillId: "", // пусто для новой рекуррентной операции
       Recurrent: recurrent,
-      PayType: "O", // добавлен в генерацию токена
+      PayType: "O",
+      Language: "ru",
     });
 
     // Важно: порядок полей должен соответствовать примеру из документации
@@ -189,8 +210,6 @@ router.post("/finish-authorize", async (req, res) => {
 
     const token = generateTinkoffTokenFinish({
       Amount: amountKop,
-      CustomerKey: userId,
-      Description: description,
       OrderId: orderId,
       PaymentId: paymentId,
     });
