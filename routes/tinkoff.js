@@ -12,28 +12,21 @@ const TINKOFF_PASSWORD = "rlkzhollw74x8uvv";
 const TINKOFF_API_URL = "https://securepay.tinkoff.ru/v2";
 
 // ============================================================
-// === Генерация токена Init ===
-// ============================================================
+// === Генератор токена Init (алфавитный порядок, Receipt = JSON string) ===
 function generateTinkoffInitToken(payload) {
-  const prepared = {};
+  // Копия payload, Receipt в виде строки
+  const prepared = { ...payload, Receipt: JSON.stringify(payload.Receipt) };
 
-  for (const [key, value] of Object.entries(payload)) {
-    if (value === undefined || value === null) continue;
-
-    if (key === "Receipt") {
-      // Для подписи сериализуем Receipt в JSON
-      prepared[key] = JSON.stringify(value);
-    } else {
-      prepared[key] = String(value);
-    }
+  // Удаляем undefined/null
+  for (const key in prepared) {
+    if (prepared[key] === undefined || prepared[key] === null) delete prepared[key];
   }
 
+  // Ключи по алфавиту
   const sortedKeys = Object.keys(prepared).sort();
 
-  // Формируем строку: key=valuekey=value...
-  const signature = sortedKeys.map((k) => `${k}=${prepared[k]}`).join("");
-
-  const raw = signature + TINKOFF_PASSWORD;
+  // Формируем строку key=valuekey=value... + пароль
+  const raw = sortedKeys.map(k => `${k}=${prepared[k]}`).join("") + TINKOFF_PASSWORD;
 
   console.log("🔐 Signature Init RAW:", raw);
 
@@ -41,8 +34,7 @@ function generateTinkoffInitToken(payload) {
 }
 
 // ============================================================
-// === Генерация токена FinishAuthorize ===
-// ============================================================
+// === Генератор токена FinishAuthorize ===
 function generateTinkoffTokenFinish({ Amount, CustomerKey, Description, OrderId, PaymentId }) {
   const raw =
     `Amount=${Amount}` +
@@ -57,9 +49,7 @@ function generateTinkoffTokenFinish({ Amount, CustomerKey, Description, OrderId,
   return crypto.createHash("sha256").update(raw, "utf8").digest("hex");
 }
 
-// ============================================================
 // === Получение RebillId через GetState ===
-// ============================================================
 async function getTinkoffState(paymentId) {
   const payload = {
     TerminalKey: TINKOFF_TERMINAL_KEY,
@@ -81,9 +71,7 @@ async function getTinkoffState(paymentId) {
   return data.PaymentData?.RebillId || null;
 }
 
-// ============================================================
 // === POST к Tinkoff API ===
-// ============================================================
 async function postTinkoff(method, payload) {
   console.log(`📤 Tinkoff request: ${method}`, payload);
 
@@ -101,22 +89,24 @@ async function postTinkoff(method, payload) {
 
 // ============================================================
 // === Init рекуррентного платежа ===
-// ============================================================
 router.post("/init", async (req, res) => {
   try {
     const { priceNextMonth, discount, userId, phone, email } = req.body;
 
     if (!priceNextMonth || discount === undefined || !userId) {
-      return res.status(400).json({ error: "Missing priceNextMonth, discount, userId" });
+      return res.status(400).json({
+        error: "Missing priceNextMonth, discount, userId",
+      });
     }
 
     const finalAmount = parseInt(priceNextMonth * (1 - discount / 100));
     const amountKop = finalAmount * 100;
 
     const orderId = `ORD-${Date.now()}-${Math.floor(Math.random() * 9000 + 1000)}`.slice(0, 36);
+
     const description = `Доступ к астро-асистенту [${priceNextMonth}р./мес.]`;
 
-    // === Receipt без лишних полей ===
+    // === Receipt ===
     const receiptObject = {
       Email: email || "",
       Phone: phone || "",
@@ -128,10 +118,26 @@ router.post("/init", async (req, res) => {
           Quantity: 1,
           Amount: amountKop,
           Tax: "none",
+          PaymentObject: "service",
         },
       ],
     };
 
+    // Payload для токена
+    const tokenPayload = {
+      Amount: amountKop,
+      CustomerKey: userId,
+      Description: description,
+      OrderId: orderId,
+      Recurrent: "1",
+      Language: "ru",
+      Receipt: receiptObject,
+    };
+
+    // Генерируем токен
+    const token = generateTinkoffInitToken(tokenPayload);
+
+    // Payload для POST
     const payload = {
       TerminalKey: TINKOFF_TERMINAL_KEY,
       Amount: amountKop,
@@ -141,15 +147,13 @@ router.post("/init", async (req, res) => {
       Recurrent: "1",
       Language: "ru",
       Receipt: receiptObject,
+      Token: token,
     };
-
-    // Токен для Init
-    payload.Token = generateTinkoffInitToken({ ...payload, Receipt: JSON.stringify(receiptObject) });
 
     const data = await postTinkoff("Init", payload);
     if (!data.Success) return res.status(400).json(data);
 
-    // Сохраняем заказ в Firestore
+    // Сохраняем заказ
     await db
       .collection("telegramUsers")
       .doc(userId)
@@ -180,11 +184,11 @@ router.post("/init", async (req, res) => {
 });
 
 // ============================================================
-// === FinishAuthorize (получение RebillId) ===
-// ============================================================
+// === FinishAuthorize (получение RebillId после первой оплаты) ===
 router.post("/finish-authorize", async (req, res) => {
   try {
     const { userId, orderId, paymentId, amount, description } = req.body;
+
     if (!userId || !orderId || !paymentId || !amount || !description) {
       return res.status(400).json({ error: "Missing params" });
     }
