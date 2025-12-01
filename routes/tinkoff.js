@@ -11,41 +11,18 @@ const TINKOFF_TERMINAL_KEY = "1691507148627";
 const TINKOFF_PASSWORD = "rlkzhollw74x8uvv";
 const TINKOFF_API_URL = "https://securepay.tinkoff.ru/v2";
 
-// ============================================================
-// === Генератор токена Init (алфавитный порядок, Receipt = JSON string) ===
-function generateTinkoffInitToken(payload) {
-  // Копия payload, Receipt в виде строки
-  const prepared = { ...payload, Receipt: JSON.stringify(payload.Receipt) };
-
-  // Удаляем undefined/null
-  for (const key in prepared) {
-    if (prepared[key] === undefined || prepared[key] === null) delete prepared[key];
-  }
-
-  // Ключи по алфавиту
-  const sortedKeys = Object.keys(prepared).sort();
-
-  // Формируем строку key=valuekey=value... + пароль
-  const raw = sortedKeys.map(k => `${k}=${prepared[k]}`).join("") + TINKOFF_PASSWORD;
-
-  console.log("🔐 Signature Init RAW:", raw);
-
+// === Генерация токена Init ===
+function generateTinkoffTokenInit({ Amount, CustomerKey, Description, OrderId, RebillId, Recurrent, Receipt }) {
+  // Составляем строку строго в порядке полей, как требует Tinkoff
+  const raw = `${Amount}${CustomerKey}${Description}${OrderId}${RebillId || ""}${Recurrent || ""}${Receipt || ""}${TINKOFF_PASSWORD}${TINKOFF_TERMINAL_KEY}`;
+  console.log("🔐 Token Init RAW:", raw);
   return crypto.createHash("sha256").update(raw, "utf8").digest("hex");
 }
 
-// ============================================================
-// === Генератор токена FinishAuthorize ===
+// === Генерация токена Finish ===
 function generateTinkoffTokenFinish({ Amount, CustomerKey, Description, OrderId, PaymentId }) {
-  const raw =
-    `Amount=${Amount}` +
-    `CustomerKey=${CustomerKey}` +
-    `Description=${Description}` +
-    `OrderId=${OrderId}` +
-    `PaymentId=${PaymentId}` +
-    TINKOFF_PASSWORD;
-
-  console.log("🔐 Signature Finish RAW:", raw);
-
+  const raw = `${Amount}${CustomerKey}${Description}${OrderId}${PaymentId}${TINKOFF_PASSWORD}${TINKOFF_TERMINAL_KEY}`;
+  console.log("🔐 Token Finish RAW:", raw);
   return crypto.createHash("sha256").update(raw, "utf8").digest("hex");
 }
 
@@ -87,26 +64,18 @@ async function postTinkoff(method, payload) {
   return data;
 }
 
-// ============================================================
-// === Init рекуррентного платежа ===
+// === Init платежа с рекуррентом ===
 router.post("/init", async (req, res) => {
   try {
-    const { priceNextMonth, discount, userId, phone, email } = req.body;
+    const { amount, userId, description, email, phone } = req.body;
 
-    if (!priceNextMonth || discount === undefined || !userId) {
-      return res.status(400).json({
-        error: "Missing priceNextMonth, discount, userId",
-      });
+    if (!amount || !userId || !description) {
+      return res.status(400).json({ error: "Missing amount, userId, description" });
     }
 
-    const finalAmount = parseInt(priceNextMonth * (1 - discount / 100));
-    const amountKop = finalAmount * 100;
-
+    const amountKop = Math.round(amount * 100);
     const orderId = `ORD-${Date.now()}-${Math.floor(Math.random() * 9000 + 1000)}`.slice(0, 36);
 
-    const description = `Доступ к астро-асистенту [${priceNextMonth}р./мес.]`;
-
-    // === Receipt ===
     const receiptObject = {
       Email: email || "",
       Phone: phone || "",
@@ -123,37 +92,36 @@ router.post("/init", async (req, res) => {
       ],
     };
 
-    // Payload для токена
-    const tokenPayload = {
+    const receiptString = JSON.stringify(receiptObject);
+
+    const recurrent = "1"; // активируем рекуррент
+
+    // Генерация токена с рекуррентом
+    const token = generateTinkoffTokenInit({
       Amount: amountKop,
       CustomerKey: userId,
       Description: description,
       OrderId: orderId,
-      Recurrent: "1",
-      Language: "ru",
-      Receipt: receiptObject,
-    };
+      RebillId: "",
+      Recurrent: recurrent,
+      Receipt: receiptString,
+    });
 
-    // Генерируем токен
-    const token = generateTinkoffInitToken(tokenPayload);
-
-    // Payload для POST
     const payload = {
       TerminalKey: TINKOFF_TERMINAL_KEY,
       Amount: amountKop,
       OrderId: orderId,
       Description: description,
       CustomerKey: userId,
-      Recurrent: "1",
+      Token: token,
+      Recurrent: recurrent,
       Language: "ru",
       Receipt: receiptObject,
-      Token: token,
     };
 
     const data = await postTinkoff("Init", payload);
     if (!data.Success) return res.status(400).json(data);
 
-    // Сохраняем заказ
     await db
       .collection("telegramUsers")
       .doc(userId)
@@ -162,12 +130,9 @@ router.post("/init", async (req, res) => {
       .set({
         orderId,
         amountKop,
-        amount: finalAmount,
+        currency: "RUB",
         description,
-        tinkoff: {
-          PaymentId: data.PaymentId,
-          PaymentURL: data.PaymentURL,
-        },
+        tinkoff: { PaymentId: data.PaymentId, PaymentURL: data.PaymentURL },
         rebillId: null,
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
       });
@@ -176,6 +141,7 @@ router.post("/init", async (req, res) => {
       PaymentURL: data.PaymentURL,
       PaymentId: data.PaymentId,
       orderId,
+      rebillId: null,
     });
   } catch (err) {
     console.error("❌ /init error:", err);
@@ -183,7 +149,6 @@ router.post("/init", async (req, res) => {
   }
 });
 
-// ============================================================
 // === FinishAuthorize (получение RebillId после первой оплаты) ===
 router.post("/finish-authorize", async (req, res) => {
   try {
@@ -215,6 +180,7 @@ router.post("/finish-authorize", async (req, res) => {
     const data = await postTinkoff("FinishAuthorize", payload);
     if (!data.Success) return res.status(400).json(data);
 
+    // Получаем RebillId после первой оплаты
     const rebillId = await getTinkoffState(paymentId);
 
     await db
@@ -223,7 +189,7 @@ router.post("/finish-authorize", async (req, res) => {
       .collection("orders")
       .doc(orderId)
       .update({
-        tinkoff: data,
+        tinkoff: { ...data },
         rebillId,
         finishedAt: admin.firestore.FieldValue.serverTimestamp(),
       });
