@@ -15,64 +15,33 @@ const TINKOFF_API_URL = "https://securepay.tinkoff.ru/v2";
 const NOTIFICATION_URL = "https://astro-1-nns5.onrender.com/api/webhook";
 
 /* ============================================================
-   🔐 Универсальная генерация токена Tinkoff для Init/FinishAuthorize/GetState
-   Token = SHA256(values(sortedKeys) + Password)
-   (Этот используется для Init/FinishAuthorize/GetState — оставлен как есть)
+   🔐 Универсальная генерация токена Tinkoff (Init, Charge, др.)
+   Token = SHA256( values(sortedKeys) + Password )
    ============================================================ */
 function generateTinkoffToken(params) {
+  // 1. Берём только root поля и исключаем Token
   const filtered = {};
-
   for (const key of Object.keys(params)) {
     if (key !== "Token" && params[key] !== undefined && params[key] !== null) {
       filtered[key] = params[key];
     }
   }
 
+  // 2. Добавляем Password в корень, как требует документация
+  filtered["Password"] = TINKOFF_PASSWORD;
+
+  // 3. Сортировка ключей (строго по алфавиту)
   const sortedKeys = Object.keys(filtered).sort();
-  const rawString = sortedKeys.map((k) => `${filtered[k]}`).join("") + TINKOFF_PASSWORD;
 
-  console.log("🔐 Token RAW:", rawString);
+  // 4. Конкатенация только значений
+  const concatenated = sortedKeys.map((key) => `${filtered[key]}`).join("");
 
-  return crypto.createHash("sha256").update(rawString, "utf8").digest("hex");
+  console.log("🔐 Token string:", concatenated);
+
+  // 5. SHA-256
+  return crypto.createHash("sha256").update(concatenated, "utf8").digest("hex");
 }
 
-/* ============================================================
-   Генерация токена строго для Charge (MIT COF)
-   Порядок (строго!): TerminalKey, PaymentId, RebillId, Amount (если есть),
-   IP (если есть), SendEmail (если есть), InfoEmail (если есть), Password
-   ============================================================ */
-function generateChargeTokenStrict(opts) {
-  const parts = [];
-
-  parts.push(opts.TerminalKey || "");
-  parts.push(opts.PaymentId || "");
-  parts.push(opts.RebillId || "");
-
-  if (typeof opts.Amount !== "undefined" && opts.Amount !== null) {
-    parts.push(String(opts.Amount));
-  }
-
-  // IP участвует в подписи (если есть)
-  parts.push(opts.IP || "");
-
-  // SendEmail участвует (строка 'true'/'false' если передан)
-  if (typeof opts.SendEmail !== "undefined") {
-    parts.push(String(Boolean(opts.SendEmail)));
-  } else {
-    parts.push("");
-  }
-
-  // InfoEmail участвует если есть
-  parts.push(opts.InfoEmail || "");
-
-  // И в конце — секретный ключ
-  parts.push(TINKOFF_PASSWORD);
-
-  const raw = parts.join("");
-  console.log("🔐 Charge Token RAW (strict):", raw);
-
-  return crypto.createHash("sha256").update(raw, "utf8").digest("hex");
-}
 
 /* ============================================================
    POST wrapper
@@ -119,7 +88,6 @@ async function findOrderByOrderId(orderId) {
 
 /* ============================================================
    Init платежа
-   (Оставлен твой рабочий Init, используем generateTinkoffToken)
    ============================================================ */
 router.post("/init", async (req, res) => {
   try {
@@ -276,7 +244,7 @@ router.post("/debug-payment", async (req, res) => {
 });
 
 /* ============================================================
-   🔥 Recurrent Charge (MIT) — исправленная версия
+   🔥 Recurrent Charge (MIT)
    ============================================================ */
 router.post("/recurrent-charge", async (req, res) => {
   try {
@@ -293,81 +261,65 @@ router.post("/recurrent-charge", async (req, res) => {
     } = req.body;
 
     if (!userId || !paymentId || !rebillId)
-      return res.status(400).json({ error: "Missing params: userId, paymentId, rebillId required" });
+      return res.status(400).json({ error: "Missing params" });
 
-    // Сумма в копейках, если передана
     const amountKop = typeof amount === "number" ? Math.round(amount * 100) : undefined;
 
-    // генерация orderId, если клиент не передал
-    const orderId = clientOrderId || `RC-${Date.now()}-${Math.floor(Math.random() * 9000 + 1000)}`.slice(0, 36);
+    const orderId =
+      clientOrderId ||
+      `RC-${Date.now()}-${Math.floor(Math.random() * 9000 + 1000)}`.slice(0, 36);
 
-    // --- Формируем объект, который участвует в подписи Charge (строго по Tinkoff) ---
-    // ВНИМАНИЕ: CustomerKey и OrderId НЕ включаем в подпись Charge (они могут быть в payload)
-    const chargeSignObj = {
+    // === Генерация токена по документации: сортировка + Password ===
+    const tokenObj = {
       TerminalKey: TINKOFF_TERMINAL_KEY,
       PaymentId: paymentId,
-      RebillId: rebillId
+      RebillId: rebillId,
+      ...(amountKop ? { Amount: amountKop } : {}),
+      CustomerKey: userId,
+      OrderId: orderId,
+      ...(ip ? { IP: ip } : {}),
+      ...(typeof sendEmail !== "undefined" ? { SendEmail: Boolean(sendEmail) } : {}),
+      ...(infoEmail ? { InfoEmail: infoEmail } : {})
     };
 
-    if (typeof amountKop !== "undefined") chargeSignObj.Amount = amountKop;
-    if (ip) chargeSignObj.IP = ip;
-    if (typeof sendEmail !== "undefined") chargeSignObj.SendEmail = Boolean(sendEmail);
-    if (infoEmail) chargeSignObj.InfoEmail = infoEmail;
+    const token = generateTinkoffToken(tokenObj);
 
-    // Генерируем токен строго по порядку для Charge
-    const token = generateChargeTokenStrict(chargeSignObj);
-
-    // --- Формируем payload строго по примеру: TerminalKey, PaymentId, RebillId, Token, IP, SendEmail, InfoEmail ---
     const payload = {
       TerminalKey: TINKOFF_TERMINAL_KEY,
       PaymentId: paymentId,
       RebillId: rebillId,
-      Token: token
+      Token: token,
+      ...(amountKop ? { Amount: amountKop } : {}),
+      CustomerKey: userId,
+      OrderId: orderId,
+      ...(ip ? { IP: ip } : {}),
+      SendEmail: Boolean(sendEmail),
+      ...(infoEmail ? { InfoEmail: infoEmail } : {})
     };
 
-    if (typeof amountKop !== "undefined") payload.Amount = amountKop;
-    // CustomerKey и OrderId можно передать в payload, но не включать в токен
-    if (userId) payload.CustomerKey = userId;
-    if (orderId) payload.OrderId = orderId;
-    if (ip) payload.IP = ip;
-    payload.SendEmail = Boolean(sendEmail);
-    if (infoEmail) payload.InfoEmail = infoEmail;
+    console.log("📦 Charge payload:", payload);
 
-    console.log("🔐 Charge Token RAW (sent):", /* token already logged by generator */ "");
-    console.log("📦 Charge payload (sent to Tinkoff):", JSON.stringify(payload));
-
-    // --- POST в Tinkoff Charge ---
     const resp = await fetch(`${TINKOFF_API_URL}/Charge`, {
       method: "POST",
-      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload)
     });
 
     const text = await resp.text();
-    console.log("📤 Charge HTTP status:", resp.status);
     console.log("📤 Charge Response RAW:", text);
 
-    let data = null;
-    try {
-      data = text ? JSON.parse(text) : null;
-    } catch (e) {
-      console.error("❌ Failed to parse Tinkoff response:", e.message);
-      return res.status(500).json({ error: "Invalid response from Tinkoff", httpStatus: resp.status, raw: text });
-    }
+    const data = JSON.parse(text);
 
-    if (!data || data.Success !== true) {
-      console.error("❌ Charge failed:", data);
+    if (!data.Success)
       return res.status(400).json({ error: "Charge failed", tinkoff: data, raw: text });
-    }
 
-    // --- Сохраняем заказ в Firestore при успехе ---
     await db.collection("telegramUsers")
       .doc(userId)
       .collection("orders")
       .doc(orderId)
       .set({
         orderId,
-        amountKop: typeof amountKop !== "undefined" ? amountKop : null,
+        amountKop: amountKop ?? null,
         currency: "RUB",
         description: description || "recurrent charge",
         tinkoff: data,
@@ -375,10 +327,9 @@ router.post("/recurrent-charge", async (req, res) => {
         createdAt: admin.firestore.FieldValue.serverTimestamp()
       });
 
-    return res.json({ ...data, rebillId });
+    res.json({ ...data, rebillId });
   } catch (err) {
-    console.error("❌ /recurrent-charge error:", err);
-    return res.status(500).json({ error: err.message });
+    res.status(500).json({ error: err.message });
   }
 });
 
