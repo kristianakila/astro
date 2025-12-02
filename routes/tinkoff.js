@@ -168,32 +168,37 @@ router.post("/debug-payment", async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// === Рекуррентное списание по RebillId (MIT COF Recurring) ===
 router.post("/recurrent-charge", async (req, res) => {
   try {
-    const { userId, rebillId, amount, description, paymentId } = req.body;
-    if (!userId || !rebillId || !amount || !description || !paymentId)
-      return res.status(400).json({ error: "Missing params: userId, rebillId, amount, description, paymentId required" });
+    const { userId, paymentId, rebillId, amount, description } = req.body;
+    if (!userId || !paymentId || !rebillId || !amount || !description) {
+      return res.status(400).json({ error: "Missing params: userId, paymentId, rebillId, amount, description" });
+    }
 
     const amountKop = Math.round(amount * 100);
     const orderId = `RC-${Date.now()}-${Math.floor(Math.random() * 9000 + 1000)}`.slice(0, 36);
 
-    // --- Генерация токена для Charge ---
+    // === Подготовка параметров для подписи ===
     const tokenParams = {
-      Amount: amountKop,
-      CustomerKey: userId,
+      Amount: amountKop.toString(),
+      CustomerKey: userId.toString(),
       Description: description,
       OrderId: orderId,
-      PaymentId: paymentId,
-      RebillId: rebillId,
+      PaymentId: paymentId.toString(),
+      RebillId: rebillId.toString(),
       TerminalKey: TINKOFF_TERMINAL_KEY,
       Password: TINKOFF_PASSWORD
     };
 
+    // Сортировка параметров по ключу
     const sortedKeys = Object.keys(tokenParams).sort();
-    const rawToken = sortedKeys.map(k => tokenParams[k].toString()).join("");
-    console.log("🔐 Charge Token RAW:", rawToken);
-    const token = crypto.createHash("sha256").update(rawToken, "utf8").digest("hex");
+    const raw = sortedKeys.map(key => tokenParams[key]).join("");
+    console.log("🔐 Charge Token RAW:", raw);
 
+    const token = crypto.createHash("sha256").update(raw, "utf8").digest("hex");
+
+    // === Payload для Charge ===
     const payload = {
       TerminalKey: TINKOFF_TERMINAL_KEY,
       PaymentId: paymentId,
@@ -204,10 +209,9 @@ router.post("/recurrent-charge", async (req, res) => {
       OrderId: orderId,
       Token: token
     };
-
     console.log("📦 Charge payload:", payload);
 
-    // --- POST к Tinkoff ---
+    // === POST запрос ===
     const resp = await fetch(`${TINKOFF_API_URL}/Charge`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -222,7 +226,7 @@ router.post("/recurrent-charge", async (req, res) => {
       data = JSON.parse(text);
     } catch (e) {
       console.error("❌ JSON parse error:", e.message);
-      return res.status(500).json({ error: "Invalid response from Tinkoff", raw: text });
+      return res.status(500).json({ error: "Invalid response from Tinkoff", httpStatus: resp.status, raw: text });
     }
 
     if (!data.Success) {
@@ -230,7 +234,7 @@ router.post("/recurrent-charge", async (req, res) => {
       return res.status(400).json(data);
     }
 
-    // --- сохраняем новый заказ только если платеж прошёл ---
+    // === Сохраняем заказ при успехе ===
     await db.collection("telegramUsers").doc(userId).collection("orders").doc(orderId).set({
       orderId,
       amountKop,
@@ -244,12 +248,13 @@ router.post("/recurrent-charge", async (req, res) => {
       createdAt: admin.firestore.FieldValue.serverTimestamp()
     });
 
-    res.json({ ...data, rebillId, notificationUrl: NOTIFICATION_URL });
+    return res.json({ ...data, rebillId, notificationUrl: NOTIFICATION_URL });
   } catch (err) {
     console.error("❌ /recurrent-charge error:", err);
-    res.status(500).json({ error: err.message });
+    return res.status(500).json({ error: err.message });
   }
 });
+
 
 
 
