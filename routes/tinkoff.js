@@ -184,70 +184,77 @@ router.post("/webhook", async (req, res) => {
     const notification = req.body;
     console.log("📨 Tinkoff Webhook received:", notification);
 
-    // Проверяем подпись (опционально, но рекомендуется)
-    // const token = generateWebhookToken(notification);
-    // if (token !== notification.Token) {
-    //   return res.status(401).json({ error: "Invalid signature" });
-    // }
+    /**
+     * Ожидаемые поля:
+     * description      — описание
+     * name             — ФИО клиента
+     * order_number     — идентификатор заказа
+     * paymentId        — идентификатор платежа
+     * source           — способ оплаты
+     * phone            — телефон
+     * terminalKey      — идентификатор терминала
+     */
 
-    // Проверяем успешность платежа
-    if (notification.Success && notification.Status === "CONFIRMED") {
-      const { OrderId, PaymentId, RebillId, CustomerKey } = notification;
-      
-      console.log("✅ Payment confirmed! RebillId:", RebillId);
-      
-      if (RebillId) {
-        // Сохраняем RebillId в Firestore
-        await db
-          .collection("telegramUsers")
-          .doc(CustomerKey)
-          .collection("orders")
-          .doc(OrderId)
-          .update({
-            rebillId: RebillId,
+    const {
+      description,
+      name,
+      order_number,
+      paymentId,
+      source,
+      phone,
+      terminalKey,
+      // стандартные
+      Success,
+      Status,
+      OrderId,
+      PaymentId,
+      RebillId,
+      CustomerKey,
+    } = notification;
+
+    // Проверка успешного платежа
+    if (Success && Status === "CONFIRMED") {
+      console.log("✅ Payment confirmed:", {
+        order_number,
+        paymentId,
+        name,
+        phone,
+        source,
+      });
+
+      // Обновляем документ заказа в Firestore
+      await db
+        .collection("telegramUsers")
+        .doc(CustomerKey)
+        .collection("orders")
+        .doc(OrderId)
+        .set(
+          {
+            rebillId: RebillId || null,
             tinkoffNotification: notification,
+            customFields: {
+              description: description || null,
+              name: name || null,
+              order_number: order_number || null,
+              paymentId: paymentId || PaymentId || null,
+              source: source || null,
+              phone: phone || null,
+              terminalKey: terminalKey || null,
+            },
             notifiedAt: admin.firestore.FieldValue.serverTimestamp(),
-          });
-        
-        console.log(`💾 RebillId ${RebillId} saved for order ${OrderId}`);
-      }
-      
-      // Тут можно добавить логику для отправки уведомлений пользователю
-      // или обновления баланса
+          },
+          { merge: true }
+        );
+
+      console.log(`💾 Webhook data saved for order ${OrderId}`);
     }
 
-    // Всегда возвращаем успешный ответ Tinkoff
     res.json({ Success: true });
-    
   } catch (err) {
     console.error("❌ Webhook error:", err);
-    // Все равно возвращаем успех, чтобы Tinkoff не отправлял повторно
     res.json({ Success: true });
   }
 });
 
-// === Генерация токена для вебхука (для проверки подписи) ===
-function generateWebhookToken(notification) {
-  // Для вебхука Tinkoff отправляет токен, сгенерированный из:
-  // Amount + OrderId + Password + PaymentId + Status + TerminalKey
-  const params = [
-    { key: "Amount", value: notification.Amount.toString() },
-    { key: "OrderId", value: notification.OrderId },
-    { key: "Password", value: TINKOFF_PASSWORD },
-    { key: "PaymentId", value: notification.PaymentId },
-    { key: "Status", value: notification.Status },
-    { key: "TerminalKey", value: notification.TerminalKey }
-  ];
-  
-  // Если есть дополнительные поля
-  if (notification.RebillId) {
-    params.push({ key: "RebillId", value: notification.RebillId });
-  }
-  
-  params.sort((a, b) => a.key.localeCompare(b.key));
-  const raw = params.map(p => p.value).join("");
-  
-  return crypto.createHash("sha256").update(raw, "utf8").digest("hex");
-}
 
 export default router;
