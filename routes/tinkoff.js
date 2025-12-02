@@ -14,25 +14,37 @@ const NOTIFICATION_URL = "https://astro-1-nns5.onrender.com/api/webhook";
 
 // === Универсальная генерация токена ===
 function generateTinkoffTokenInit(params) {
-  const base = [
-    { key: "Amount", value: params.Amount?.toString() || "" },
-    { key: "CustomerKey", value: params.CustomerKey || "" },
-    { key: "Description", value: params.Description || "" },
-    { key: "OrderId", value: params.OrderId || "" },
-    { key: "PaymentId", value: params.PaymentId || "" },
-    { key: "Password", value: TINKOFF_PASSWORD },
-    { key: "TerminalKey", value: TINKOFF_TERMINAL_KEY },
-    { key: "RebillId", value: params.RebillId || "" },
-    { key: "Recurrent", value: params.Recurrent || "" },
-    { key: "PayType", value: params.PayType || "" },
-    { key: "Language", value: params.Language || "" },
-    { key: "NotificationURL", value: params.NotificationURL || "" },
-    { key: "Status", value: params.Status || "" },
-    { key: "OperationInitiatorType", value: params.OperationInitiatorType || "" }
-  ];
-  const sorted = base.filter(p => p.value !== "").sort((a, b) => a.key.localeCompare(b.key));
-  const raw = sorted.map(p => p.value).join("");
-  console.log("🔐 Token RAW:", raw);
+  // Собираем все параметры
+  const paramsMap = new Map();
+  
+  // Обязательно добавляем все возможные параметры
+  if (params.Amount !== undefined && params.Amount !== "") paramsMap.set("Amount", params.Amount.toString());
+  if (params.CustomerKey) paramsMap.set("CustomerKey", params.CustomerKey);
+  if (params.Description) paramsMap.set("Description", params.Description);
+  if (params.OrderId) paramsMap.set("OrderId", params.OrderId);
+  if (params.PaymentId) paramsMap.set("PaymentId", params.PaymentId);
+  if (params.RebillId) paramsMap.set("RebillId", params.RebillId);
+  if (params.Recurrent) paramsMap.set("Recurrent", params.Recurrent);
+  if (params.PayType) paramsMap.set("PayType", params.PayType);
+  if (params.Language) paramsMap.set("Language", params.Language);
+  if (params.NotificationURL) paramsMap.set("NotificationURL", params.NotificationURL);
+  if (params.Status) paramsMap.set("Status", params.Status);
+  if (params.OperationInitiatorType) paramsMap.set("OperationInitiatorType", params.OperationInitiatorType);
+  
+  // Обязательные для всех запросов
+  paramsMap.set("Password", TINKOFF_PASSWORD);
+  paramsMap.set("TerminalKey", TINKOFF_TERMINAL_KEY);
+  
+  // Сортируем по ключу (алфавитный порядок)
+  const sortedKeys = Array.from(paramsMap.keys()).sort();
+  
+  // Формируем строку
+  const raw = sortedKeys.map(key => paramsMap.get(key)).join("");
+  
+  console.log("🔐 Token RAW string:", raw);
+  console.log("🔐 Token params order:", sortedKeys);
+  console.log("🔐 Token params values:", sortedKeys.map(key => `${key}:${paramsMap.get(key)}`));
+  
   return crypto.createHash("sha256").update(raw, "utf8").digest("hex");
 }
 
@@ -85,10 +97,8 @@ router.post("/init", async (req, res) => {
       CustomerKey: userId, 
       Description: description,
       OrderId: orderId, 
-      RebillId: "", 
       Recurrent: recurrent,
       PayType: "O", 
-      Language: "ru", 
       NotificationURL: NOTIFICATION_URL
     });
 
@@ -101,19 +111,7 @@ router.post("/init", async (req, res) => {
       CustomerKey: userId,
       Recurrent: recurrent,
       PayType: "O",
-      Language: "ru",
-      NotificationURL: NOTIFICATION_URL,
-      Receipt: { 
-        Email: "test@example.com", 
-        Taxation: "usn_income", 
-        Items: [{ 
-          Name: description, 
-          Price: amountKop, 
-          Quantity: 1, 
-          Amount: amountKop, 
-          Tax: "none" 
-        }] 
-      }
+      NotificationURL: NOTIFICATION_URL
     };
 
     const data = await postTinkoff("Init", payload);
@@ -147,76 +145,6 @@ router.post("/init", async (req, res) => {
   }
 });
 
-// === FinishAuthorize платежа ===
-router.post("/finish-authorize", async (req, res) => {
-  try {
-    const { userId, orderId, paymentId, amount, description } = req.body;
-    if (!userId || !orderId || !paymentId || !amount || !description) return res.status(400).json({ error: "Missing params" });
-
-    const amountKop = Math.round(amount * 100);
-    const token = generateTinkoffTokenInit({ 
-      Amount: amountKop, 
-      OrderId: orderId, 
-      PaymentId: paymentId, 
-      NotificationURL: NOTIFICATION_URL 
-    });
-
-    const payload = { 
-      TerminalKey: TINKOFF_TERMINAL_KEY, 
-      PaymentId: paymentId, 
-      Amount: amountKop, 
-      OrderId: orderId, 
-      Description: description, 
-      Token: token, 
-      NotificationURL: NOTIFICATION_URL 
-    };
-    const data = await postTinkoff("FinishAuthorize", payload);
-    if (!data.Success) return res.status(400).json(data);
-
-    const rebillId = await getTinkoffState(paymentId);
-    await db.collection("telegramUsers").doc(userId).collection("orders").doc(orderId).update({
-      tinkoff: { ...data }, 
-      rebillId, 
-      finishedAt: admin.firestore.FieldValue.serverTimestamp()
-    });
-
-    res.json({ ...data, rebillId, notificationUrl: NOTIFICATION_URL });
-  } catch (err) { 
-    console.error("❌ Error in /finish-authorize:", err);
-    res.status(500).json({ error: err.message }); 
-  }
-});
-
-// === Проверка состояния платежа ===
-router.post("/check-payment", async (req, res) => {
-  try {
-    const { paymentId } = req.body;
-    if (!paymentId) return res.status(400).json({ error: "Missing paymentId" });
-    const rebillId = await getTinkoffState(paymentId);
-    res.json({ paymentId, rebillId, hasRebill: !!rebillId, notificationUrl: NOTIFICATION_URL });
-  } catch (err) { 
-    console.error("❌ Error in /check-payment:", err);
-    res.status(500).json({ error: err.message }); 
-  }
-});
-
-// === Debug платежа ===
-router.post("/debug-payment", async (req, res) => {
-  try {
-    const { paymentId } = req.body;
-    const token = generateTinkoffTokenInit({ PaymentId: paymentId });
-    const resp = await postTinkoff("GetState", { 
-      TerminalKey: TINKOFF_TERMINAL_KEY, 
-      PaymentId: paymentId, 
-      Token: token 
-    });
-    res.json({ paymentId, notificationUrl: NOTIFICATION_URL, ...resp });
-  } catch (err) { 
-    console.error("❌ Error in /debug-payment:", err);
-    res.status(500).json({ error: err.message }); 
-  }
-});
-
 // === Рекуррентное списание по RebillId (MIT COF Recurring) ===
 router.post("/recurrent-charge", async (req, res) => {
   try {
@@ -229,19 +157,20 @@ router.post("/recurrent-charge", async (req, res) => {
     const amountKop = Math.round(amount * 100);
     const orderId = `RC-${Date.now()}-${Math.floor(Math.random() * 9000 + 1000)}`.slice(0, 36);
 
-    // Генерация токена с OperationInitiatorType
+    // Генерация токена с правильным порядком параметров
     const tokenParams = {
       Amount: amountKop,
       CustomerKey: userId,
       Description: description,
-      OrderId: orderId,
-      RebillId: rebillId,
-      PayType: "O",
       NotificationURL: NOTIFICATION_URL,
-      OperationInitiatorType: "R" // ключевой параметр для MIT COF
+      OperationInitiatorType: "R", // ключевой параметр для MIT COF
+      OrderId: orderId,
+      PayType: "O",
+      RebillId: rebillId,
+      // TerminalKey и Password добавляются автоматически в функции
     };
     
-    console.log("🔧 Token generation params:", tokenParams);
+    console.log("🔧 Token generation params for recurrent:", tokenParams);
     
     const token = generateTinkoffTokenInit(tokenParams);
 
@@ -254,8 +183,8 @@ router.post("/recurrent-charge", async (req, res) => {
       Description: description,
       NotificationURL: NOTIFICATION_URL,
       OperationInitiatorType: "R", // MIT транзакция
-      Token: token,
-      PayType: "O" // Одностадийная оплата
+      PayType: "O", // Одностадийная оплата
+      Token: token
     };
 
     console.log("🚀 Sending recurrent charge to Tinkoff:", payload);
@@ -265,7 +194,11 @@ router.post("/recurrent-charge", async (req, res) => {
     
     if (!data.Success) {
       console.error("❌ Tinkoff rejected recurrent charge:", data);
-      return res.status(400).json(data);
+      return res.status(400).json({
+        error: "Tinkoff rejected recurrent charge",
+        tinkoffError: data,
+        paramsUsed: tokenParams
+      });
     }
 
     console.log("✅ Recurrent charge successful:", data);
@@ -348,7 +281,7 @@ router.post("/webhook", async (req, res) => {
     res.json({ Success: true });
   } catch (err) { 
     console.error("❌ Webhook error:", err); 
-    res.json({ Success: true }); // Всегда возвращаем Success: true Tinkoff
+    res.json({ Success: true });
   }
 });
 
