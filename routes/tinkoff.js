@@ -10,7 +10,7 @@ const router = express.Router();
 const TINKOFF_TERMINAL_KEY = "1691507148627";
 const TINKOFF_PASSWORD = "rlkzhollw74x8uvv";
 const TINKOFF_API_URL = "https://securepay.tinkoff.ru/v2";
-const NOTIFICATION_URL = "https://astro-1-nns5.onrender.com/api/tinkoff/webhook";
+const NOTIFICATION_URL = "https://astro-1-nns5.onrender.com/api/webhook";
 
 // === Генерация токена Init ===
 function generateTinkoffTokenInit({
