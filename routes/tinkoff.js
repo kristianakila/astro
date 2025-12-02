@@ -184,77 +184,43 @@ router.post("/webhook", async (req, res) => {
     const notification = req.body;
     console.log("📨 Tinkoff Webhook received:", notification);
 
-    /**
-     * Ожидаемые поля:
-     * description      — описание
-     * name             — ФИО клиента
-     * order_number     — идентификатор заказа
-     * paymentId        — идентификатор платежа
-     * source           — способ оплаты
-     * phone            — телефон
-     * terminalKey      — идентификатор терминала
-     */
+    // Проверяем подпись (опционально, но рекомендуется)
+    // const token = generateWebhookToken(notification);
+    // if (token !== notification.Token) {
+    //   return res.status(401).json({ error: "Invalid signature" });
+    // }
 
-    const {
-      description,
-      name,
-      order_number,
-      paymentId,
-      source,
-      phone,
-      terminalKey,
-      // стандартные
-      Success,
-      Status,
-      OrderId,
-      PaymentId,
-      RebillId,
-      CustomerKey,
-    } = notification;
-
-    // Проверка успешного платежа
-    if (Success && Status === "CONFIRMED") {
-      console.log("✅ Payment confirmed:", {
-        order_number,
-        paymentId,
-        name,
-        phone,
-        source,
-      });
-
-      // Обновляем документ заказа в Firestore
-      await db
-        .collection("telegramUsers")
-        .doc(CustomerKey)
-        .collection("orders")
-        .doc(OrderId)
-        .set(
-          {
-            rebillId: RebillId || null,
+    // Проверяем успешность платежа
+    if (notification.Success && notification.Status === "CONFIRMED") {
+      const { OrderId, PaymentId, RebillId, CustomerKey } = notification;
+      
+      console.log("✅ Payment confirmed! RebillId:", RebillId);
+      
+      if (RebillId) {
+        // Сохраняем RebillId в Firestore
+        await db
+          .collection("telegramUsers")
+          .doc(CustomerKey)
+          .collection("orders")
+          .doc(OrderId)
+          .update({
+            rebillId: RebillId,
             tinkoffNotification: notification,
-            customFields: {
-              description: description || null,
-              name: name || null,
-              order_number: order_number || null,
-              paymentId: paymentId || PaymentId || null,
-              source: source || null,
-              phone: phone || null,
-              terminalKey: terminalKey || null,
-            },
             notifiedAt: admin.firestore.FieldValue.serverTimestamp(),
-          },
-          { merge: true }
-        );
-
-      console.log(`💾 Webhook data saved for order ${OrderId}`);
+          });
+        
+        console.log(`💾 RebillId ${RebillId} saved for order ${OrderId}`);
+      }
     }
 
     res.json({ Success: true });
+    
   } catch (err) {
     console.error("❌ Webhook error:", err);
     res.json({ Success: true });
   }
 });
+
 
 
 export default router;
