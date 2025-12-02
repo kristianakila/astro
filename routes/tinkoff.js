@@ -201,10 +201,30 @@ router.post("/recurrent-charge", async (req, res) => {
       Token: token
     };
 
-    const data = await postTinkoff("Rebill", payload);
-    if (!data.Success) return res.status(400).json(data);
+    // --- безопасный POST к Tinkoff ---
+    const resp = await fetch(`${TINKOFF_API_URL}/Rebill`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
 
-    // Сохраняем новый заказ в Firestore
+    const text = await resp.text();
+    console.log("📤 Tinkoff Rebill raw response:", text);
+
+    let data;
+    try {
+      data = JSON.parse(text);
+    } catch (e) {
+      console.error("❌ JSON parse error:", e.message);
+      return res.status(500).json({ error: "Invalid response from Tinkoff", raw: text });
+    }
+
+    if (!data.Success) {
+      console.error("❌ Rebill failed:", data);
+      return res.status(400).json(data);
+    }
+
+    // --- сохраняем новый заказ только если платеж прошёл ---
     await db.collection("telegramUsers").doc(userId).collection("orders").doc(orderId).set({
       orderId,
       amountKop,
@@ -220,9 +240,11 @@ router.post("/recurrent-charge", async (req, res) => {
 
     res.json({ ...data, rebillId, notificationUrl: NOTIFICATION_URL });
   } catch (err) {
+    console.error("❌ /recurrent-charge error:", err);
     res.status(500).json({ error: err.message });
   }
 });
+
 
 // === Вебхук Tinkoff ===
 router.post("/webhook", async (req, res) => {
