@@ -171,75 +171,128 @@ router.post("/debug-payment", async (req, res) => {
 // === Рекуррентное списание по RebillId (MIT COF Recurring) ===
 router.post("/recurrent-charge", async (req, res) => {
   try {
-    const { userId, paymentId, rebillId, amount, description } = req.body;
-    if (!userId || !paymentId || !rebillId || !amount || !description) {
-      return res.status(400).json({ error: "Missing params: userId, paymentId, rebillId, amount, description" });
+    const {
+      userId,
+      paymentId,
+      rebillId,
+      amount,         // рубли, опционально
+      description,    // опционально
+      orderId: clientOrderId, // опционально
+      ip,             // опционально, example: "2011:0db8:85a3:0101:0101:8a2e:0370:7334"
+      sendEmail = false,   // опционально
+      infoEmail = ""       // опционально
+    } = req.body;
+
+    if (!userId || !paymentId || !rebillId) {
+      return res.status(400).json({ error: "Missing params: userId, paymentId and rebillId are required" });
     }
 
-    const amountKop = Math.round(amount * 100);
-    const orderId = `RC-${Date.now()}-${Math.floor(Math.random() * 9000 + 1000)}`.slice(0, 36);
+    // amount в копейках (если передан)
+    const amountKop = typeof amount === "number" ? Math.round(amount * 100) : undefined;
 
-    // === Подготовка параметров для подписи ===
+    // orderId — генерируем, если клиент не передал
+    const orderId = clientOrderId || `RC-${Date.now()}-${Math.floor(Math.random() * 9000 + 1000)}`.slice(0, 36);
+
+    // === Функция генерации токена в строгом порядке параметров ===
+    function generateChargeTokenStrict(opts) {
+      // Порядок — строго такой: TerminalKey, PaymentId, RebillId, Amount (если есть),
+      // CustomerKey (userId, если есть), OrderId, IP, SendEmail, InfoEmail, Password
+      const parts = [];
+
+      parts.push(opts.TerminalKey ?? "");
+      parts.push(opts.PaymentId ?? "");
+      parts.push(opts.RebillId ?? "");
+
+      if (opts.Amount !== undefined && opts.Amount !== null) parts.push(String(opts.Amount));
+      if (opts.CustomerKey) parts.push(String(opts.CustomerKey));
+      if (opts.OrderId) parts.push(String(opts.OrderId));
+      if (opts.IP) parts.push(String(opts.IP));
+      // SendEmail — приводим к 'true'/'false' строке если был явно передан
+      if (typeof opts.SendEmail !== "undefined") parts.push(String(Boolean(opts.SendEmail)));
+      if (opts.InfoEmail) parts.push(String(opts.InfoEmail));
+
+      // в конце добавляем пароль (секрет терминала) — обязательно
+      parts.push(TINKOFF_PASSWORD);
+
+      const raw = parts.join("");
+      console.log("🔐 Charge Token RAW (strict order):", raw);
+      return crypto.createHash("sha256").update(raw, "utf8").digest("hex");
+    }
+
+    // === Собираем параметры для подписи ===
     const tokenParams = {
-      Amount: amountKop.toString(),
-      CustomerKey: userId.toString(),
-      Description: description,
-      OrderId: orderId,
-      PaymentId: paymentId.toString(),
-      RebillId: rebillId.toString(),
       TerminalKey: TINKOFF_TERMINAL_KEY,
-      Password: TINKOFF_PASSWORD
+      PaymentId: paymentId,
+      RebillId: rebillId,
+      // если amountKop присутствует, включаем
+      ...(typeof amountKop !== "undefined" ? { Amount: amountKop } : {}),
+      CustomerKey: userId,
+      OrderId: orderId,
+      IP: ip,
+      SendEmail: sendEmail,
+      InfoEmail: infoEmail
     };
 
-    // Сортировка параметров по ключу
-    const sortedKeys = Object.keys(tokenParams).sort();
-    const raw = sortedKeys.map(key => tokenParams[key]).join("");
-    console.log("🔐 Charge Token RAW:", raw);
+    // Генерация токена строго в порядке, который прописан в generateChargeTokenStrict
+    const token = generateChargeTokenStrict(tokenParams);
 
-    const token = crypto.createHash("sha256").update(raw, "utf8").digest("hex");
-
-    // === Payload для Charge ===
+    // === Формируем payload строго по примеру: TerminalKey, PaymentId, RebillId, Token, IP, SendEmail, InfoEmail
+    // Добавляем Amount/CustomerKey/OrderId только если есть — но Token уже сформирован с учётом этих полей (если они были)
     const payload = {
       TerminalKey: TINKOFF_TERMINAL_KEY,
       PaymentId: paymentId,
       RebillId: rebillId,
-      Amount: amountKop,
-      CustomerKey: userId,
-      Description: description,
-      OrderId: orderId,
       Token: token
     };
-    console.log("📦 Charge payload:", payload);
 
-    // === POST запрос ===
+    if (typeof amountKop !== "undefined") payload.Amount = amountKop;
+    if (userId) payload.CustomerKey = userId;
+    if (orderId) payload.OrderId = orderId;
+    if (ip) payload.IP = ip;
+    // в теле запроса в примере IP, SendEmail, InfoEmail идут после Token — соблюдаем это
+    if (typeof sendEmail !== "undefined") payload.SendEmail = Boolean(sendEmail);
+    if (infoEmail) payload.InfoEmail = infoEmail;
+
+    // логируем payload для отладки (убрать/редуцировать в prod)
+    console.log("📦 Charge payload (sent to Tinkoff):", JSON.stringify(payload));
+
+    // === Отправка запроса в Tinkoff Charge ===
     const resp = await fetch(`${TINKOFF_API_URL}/Charge`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload)
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify(payload),
+      // добавим таймаут если нужно через AbortController в будущем
     });
 
     const text = await resp.text();
+    console.log("📤 Tinkoff Charge HTTP status:", resp.status);
     console.log("📤 Tinkoff Charge raw response:", text);
 
     let data;
     try {
-      data = JSON.parse(text);
+      data = text ? JSON.parse(text) : null;
     } catch (e) {
       console.error("❌ JSON parse error:", e.message);
-      return res.status(500).json({ error: "Invalid response from Tinkoff", httpStatus: resp.status, raw: text });
+      return res.status(500).json({
+        error: "Invalid response from Tinkoff (not JSON)",
+        httpStatus: resp.status,
+        raw: text,
+        tokenRawExample: "see server logs"
+      });
     }
 
-    if (!data.Success) {
+    if (!data || data.Success !== true) {
       console.error("❌ Charge failed:", data);
-      return res.status(400).json(data);
+      // возвращаем тело от tinkoff прямо клиенту для отладки
+      return res.status(400).json({ error: "Charge failed", httpStatus: resp.status, tinkoff: data, raw: text });
     }
 
-    // === Сохраняем заказ при успехе ===
+    // === При успехе сохраняем заказ в Firestore ===
     await db.collection("telegramUsers").doc(userId).collection("orders").doc(orderId).set({
       orderId,
-      amountKop,
+      amountKop: typeof amountKop !== "undefined" ? amountKop : null,
       currency: "RUB",
-      description,
+      description: description || "recurrent charge",
       tinkoff: { ...data },
       rebillId,
       recurrent: "Y",
