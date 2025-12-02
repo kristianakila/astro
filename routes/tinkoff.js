@@ -87,6 +87,32 @@ function generateTinkoffTokenFinish({ Amount, OrderId, PaymentId, NotificationUR
   return crypto.createHash("sha256").update(raw, "utf8").digest("hex");
 }
 
+// === Генерация токена для рекуррентного платежа ===
+function generateTinkoffTokenCharge({
+  Amount,
+  OrderId,
+  RebillId,
+  Description
+}) {
+  const params = [
+    { key: "Amount", value: Amount.toString() },
+    { key: "Description", value: Description },
+    { key: "OrderId", value: OrderId },
+    { key: "Password", value: TINKOFF_PASSWORD },
+    { key: "RebillId", value: RebillId },
+    { key: "TerminalKey", value: TINKOFF_TERMINAL_KEY }
+  ];
+
+  // Сортируем по алфавиту по ключу
+  params.sort((a, b) => a.key.localeCompare(b.key));
+
+  // Конкатенируем значения
+  const raw = params.map(p => p.value).join("");
+  console.log("🔐 Token Charge (Recurrent) RAW:", raw);
+
+  return crypto.createHash("sha256").update(raw, "utf8").digest("hex");
+}
+
 // === Получение RebillId через GetState ===
 async function getTinkoffState(paymentId) {
   const payload = {
@@ -161,6 +187,324 @@ async function findOrderByOrderId(orderId) {
     return null;
   }
 }
+
+// === Инициирование рекуррентного платежа (ручное списание) ===
+router.post("/charge-recurrent", async (req, res) => {
+  try {
+    const { userId, amount, description, rebillId } = req.body;
+
+    // Проверяем обязательные параметры
+    if (!userId || !amount || !description || !rebillId) {
+      return res.status(400).json({ 
+        error: "Missing required parameters", 
+        required: ["userId", "amount", "description", "rebillId"] 
+      });
+    }
+
+    // Проверяем существование пользователя
+    const userDoc = await db.collection("telegramUsers").doc(userId).get();
+    if (!userDoc.exists) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    // Генерируем новый OrderId для рекуррентного платежа
+    const amountKop = Math.round(amount * 100);
+    const orderId = `RCR-${Date.now()}-${Math.floor(Math.random() * 9000 + 1000)}`.slice(0, 36);
+
+    // Генерируем токен для рекуррентного платежа
+    const token = generateTinkoffTokenCharge({
+      Amount: amountKop,
+      OrderId: orderId,
+      RebillId: rebillId,
+      Description: description
+    });
+
+    // Подготавливаем запрос для рекуррентного платежа
+    const payload = {
+      TerminalKey: TINKOFF_TERMINAL_KEY,
+      Amount: amountKop,
+      OrderId: orderId,
+      Token: token,
+      Description: description,
+      RebillId: rebillId,
+      PaymentMethod: "recurrent", // Важно: указываем метод оплаты как рекуррентный
+      NotificationURL: NOTIFICATION_URL,
+      Receipt: {
+        Email: "test@example.com",
+        Taxation: "usn_income",
+        Items: [
+          {
+            Name: description,
+            Price: amountKop,
+            Quantity: 1,
+            Amount: amountKop,
+            Tax: "none"
+          }
+        ]
+      }
+    };
+
+    console.log("💰 Инициируем рекуррентный платеж:", {
+      userId,
+      amountKop,
+      orderId,
+      rebillId,
+      description
+    });
+
+    // Отправляем запрос на списание
+    const data = await postTinkoff("Init", payload);
+
+    // Обрабатываем ответ
+    if (!data.Success) {
+      console.error("❌ Ошибка рекуррентного списания:", data);
+      return res.status(400).json({
+        error: "Recurrent charge failed",
+        tinkoffResponse: data,
+        details: data.Message || "Unknown error"
+      });
+    }
+
+    // Сохраняем информацию о рекуррентном платеже в Firestore
+    await db
+      .collection("telegramUsers")
+      .doc(userId)
+      .collection("recurrentPayments")
+      .doc(orderId)
+      .set({
+        orderId,
+        userId,
+        amountKop,
+        amount,
+        currency: "RUB",
+        description,
+        rebillId,
+        tinkoff: {
+          PaymentId: data.PaymentId,
+          PaymentURL: data.PaymentURL,
+          Status: data.Status
+        },
+        status: "initiated",
+        chargeType: "manual_recurrent",
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        notificationUrl: NOTIFICATION_URL
+      });
+
+    // Также добавляем запись в общую историю платежей пользователя
+    await db
+      .collection("telegramUsers")
+      .doc(userId)
+      .collection("orders")
+      .doc(orderId)
+      .set({
+        orderId,
+        amountKop,
+        amount,
+        currency: "RUB",
+        description,
+        rebillId,
+        tinkoff: { 
+          PaymentId: data.PaymentId, 
+          PaymentURL: data.PaymentURL 
+        },
+        paymentType: "recurrent_charge",
+        recurrent: "Y",
+        payType: "O",
+        notificationUrl: NOTIFICATION_URL,
+        createdAt: admin.firestore.FieldValue.serverTimestamp()
+      });
+
+    console.log("✅ Рекуррентный платеж инициирован:", {
+      orderId,
+      paymentId: data.PaymentId,
+      status: data.Status
+    });
+
+    res.json({
+      success: true,
+      message: "Recurrent charge initiated",
+      orderId,
+      paymentId: data.PaymentId,
+      paymentUrl: data.PaymentURL,
+      status: data.Status,
+      rebillId,
+      amount,
+      description
+    });
+
+  } catch (err) {
+    console.error("❌ /charge-recurrent error:", err);
+    res.status(500).json({ 
+      error: err.message,
+      details: "Failed to initiate recurrent charge"
+    });
+  }
+});
+
+// === Получение всех рекуррентных платежей пользователя ===
+router.get("/user-recurrent-payments/:userId", async (req, res) => {
+  try {
+    const { userId } = req.params;
+
+    if (!userId) {
+      return res.status(400).json({ error: "Missing userId parameter" });
+    }
+
+    // Проверяем существование пользователя
+    const userDoc = await db.collection("telegramUsers").doc(userId).get();
+    if (!userDoc.exists) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    // Получаем все рекуррентные платежи пользователя
+    const recurrentPaymentsSnapshot = await db
+      .collection("telegramUsers")
+      .doc(userId)
+      .collection("recurrentPayments")
+      .orderBy("createdAt", "desc")
+      .get();
+
+    const payments = [];
+    recurrentPaymentsSnapshot.forEach(doc => {
+      payments.push({
+        id: doc.id,
+        ...doc.data()
+      });
+    });
+
+    // Получаем все заказы с rebillId (история рекуррентов)
+    const ordersWithRebillSnapshot = await db
+      .collection("telegramUsers")
+      .doc(userId)
+      .collection("orders")
+      .where("rebillId", "!=", null)
+      .orderBy("createdAt", "desc")
+      .get();
+
+    const rebillOrders = [];
+    ordersWithRebillSnapshot.forEach(doc => {
+      rebillOrders.push({
+        id: doc.id,
+        ...doc.data()
+      });
+    });
+
+    // Получаем первый заказ с rebillId (для получения основного rebillId)
+    const firstRebillOrderSnapshot = await db
+      .collection("telegramUsers")
+      .doc(userId)
+      .collection("orders")
+      .where("rebillId", "!=", null)
+      .orderBy("createdAt", "asc")
+      .limit(1)
+      .get();
+
+    let primaryRebillId = null;
+    if (!firstRebillOrderSnapshot.empty) {
+      primaryRebillId = firstRebillOrderSnapshot.docs[0].data().rebillId;
+    }
+
+    res.json({
+      success: true,
+      userId,
+      primaryRebillId,
+      recurrentPaymentsCount: payments.length,
+      recurrentPayments: payments,
+      rebillOrdersCount: rebillOrders.length,
+      rebillOrders: rebillOrders
+    });
+
+  } catch (err) {
+    console.error("❌ /user-recurrent-payments error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// === Проверка статуса рекуррентного платежа ===
+router.get("/check-recurrent-status/:orderId", async (req, res) => {
+  try {
+    const { orderId } = req.params;
+
+    if (!orderId) {
+      return res.status(400).json({ error: "Missing orderId parameter" });
+    }
+
+    // Ищем заказ во всей базе
+    const foundOrder = await findOrderByOrderId(orderId);
+    
+    if (!foundOrder) {
+      return res.status(404).json({ 
+        error: "Order not found",
+        orderId 
+      });
+    }
+
+    const { userId, orderData } = foundOrder;
+    const paymentId = orderData.tinkoff?.PaymentId;
+
+    if (!paymentId) {
+      return res.status(400).json({ 
+        error: "PaymentId not found in order data" 
+      });
+    }
+
+    // Проверяем статус в Tinkoff
+    const payload = {
+      TerminalKey: TINKOFF_TERMINAL_KEY,
+      PaymentId: paymentId
+    };
+
+    const raw = `${payload.PaymentId}${TINKOFF_PASSWORD}${TINKOFF_TERMINAL_KEY}`;
+    payload.Token = crypto.createHash("sha256").update(raw, "utf8").digest("hex");
+
+    const resp = await fetch(`${TINKOFF_API_URL}/GetState`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+
+    const tinkoffData = await resp.json();
+
+    // Обновляем статус в Firestore если изменился
+    if (tinkoffData.Success && tinkoffData.Status !== orderData.tinkoff?.Status) {
+      await foundOrder.orderRef.update({
+        "tinkoff.Status": tinkoffData.Status,
+        "tinkoff.LastCheck": admin.firestore.FieldValue.serverTimestamp()
+      });
+
+      // Если это рекуррентный платеж, обновляем и в коллекции recurrentPayments
+      if (orderData.chargeType === "manual_recurrent") {
+        await db
+          .collection("telegramUsers")
+          .doc(userId)
+          .collection("recurrentPayments")
+          .doc(orderId)
+          .update({
+            status: tinkoffData.Status.toLowerCase(),
+            "tinkoff.Status": tinkoffData.Status,
+            lastChecked: admin.firestore.FieldValue.serverTimestamp()
+          });
+      }
+    }
+
+    res.json({
+      success: true,
+      orderId,
+      userId,
+      localStatus: orderData.status || orderData.tinkoff?.Status,
+      tinkoffStatus: tinkoffData.Status,
+      tinkoffSuccess: tinkoffData.Success,
+      rebillId: orderData.rebillId,
+      amount: orderData.amountKop ? orderData.amountKop / 100 : null,
+      paymentId,
+      tinkoffResponse: tinkoffData
+    });
+
+  } catch (err) {
+    console.error("❌ /check-recurrent-status error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
 
 // === Init платежа ===
 router.post("/init", async (req, res) => {
@@ -431,6 +775,23 @@ router.post("/webhook", async (req, res) => {
 
         await orderRef.update(updateData);
         console.log(`✅ Заказ ${OrderId} успешно обновлен для пользователя ${userId}`);
+        
+        // Если это рекуррентный платеж, обновляем и в коллекции recurrentPayments
+        const orderData = await orderRef.get();
+        if (orderData.data()?.chargeType === "manual_recurrent") {
+          await db
+            .collection("telegramUsers")
+            .doc(userId)
+            .collection("recurrentPayments")
+            .doc(OrderId)
+            .update({
+              status: "confirmed",
+              "tinkoff.Status": notification.Status,
+              "tinkoff.Notification": notification,
+              lastUpdated: admin.firestore.FieldValue.serverTimestamp()
+            });
+          console.log(`💳 Рекуррентный платеж ${OrderId} подтвержден`);
+        }
       } else {
         console.log(`❌ Не удалось найти заказ ${OrderId} для обновления`);
         
