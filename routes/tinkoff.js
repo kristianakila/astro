@@ -125,6 +125,43 @@ async function postTinkoff(method, payload) {
   return data;
 }
 
+// === Вспомогательная функция для поиска заказа по OrderId ===
+async function findOrderByOrderId(orderId) {
+  try {
+    console.log(`🔍 Поиск заказа с OrderId: ${orderId}`);
+    
+    // Ищем во всех коллекциях заказов
+    const usersSnapshot = await db.collection("telegramUsers").get();
+    
+    for (const userDoc of usersSnapshot.docs) {
+      const userId = userDoc.id;
+      const orderRef = db
+        .collection("telegramUsers")
+        .doc(userId)
+        .collection("orders")
+        .doc(orderId);
+      
+      const orderDoc = await orderRef.get();
+      
+      if (orderDoc.exists) {
+        console.log(`✅ Найден заказ у пользователя ${userId}`);
+        return {
+          userId,
+          orderData: orderDoc.data(),
+          orderRef
+        };
+      }
+    }
+    
+    console.log(`❌ Заказ с OrderId ${orderId} не найден`);
+    return null;
+    
+  } catch (error) {
+    console.error("❌ Ошибка при поиске заказа:", error);
+    return null;
+  }
+}
+
 // === Init платежа ===
 router.post("/init", async (req, res) => {
   try {
@@ -196,6 +233,7 @@ router.post("/init", async (req, res) => {
         recurrent: recurrent,
         payType: "O",
         notificationUrl: NOTIFICATION_URL,
+        customerKey: userId, // Сохраняем явно customerKey для поиска в вебхуке
         createdAt: admin.firestore.FieldValue.serverTimestamp()
       });
 
@@ -333,39 +371,84 @@ router.post("/debug-payment", async (req, res) => {
 router.post("/webhook", async (req, res) => {
   try {
     const notification = req.body;
-    console.log("📨 Tinkoff Webhook received:", notification);
+    console.log("📨 Tinkoff Webhook received:", JSON.stringify(notification, null, 2));
     console.log("🌐 Webhook URL:", NOTIFICATION_URL);
-
-    // Проверяем подпись (опционально, но рекомендуется)
-    // const token = generateWebhookToken(notification);
-    // if (token !== notification.Token) {
-    //   return res.status(401).json({ error: "Invalid signature" });
-    // }
 
     // Проверяем успешность платежа
     if (notification.Success && notification.Status === "CONFIRMED") {
-      const { OrderId, PaymentId, RebillId, CustomerKey } = notification;
+      const { OrderId, PaymentId, RebillId } = notification;
+      
+      // Получаем CustomerKey из разных возможных полей
+      const customerKey = notification.CustomerKey || notification.customerKey;
+      
+      console.log("✅ Payment confirmed!");
+      console.log("📋 OrderId:", OrderId);
+      console.log("📋 PaymentId:", PaymentId);
+      console.log("📋 RebillId:", RebillId);
+      console.log("👤 CustomerKey:", customerKey);
 
-      console.log("✅ Payment confirmed! RebillId:", RebillId);
+      let userId = customerKey;
+      let orderRef = null;
 
-      if (RebillId) {
-        // Сохраняем RebillId в Firestore
-        await db
+      // Если есть CustomerKey, пытаемся найти заказ напрямую
+      if (userId) {
+        orderRef = db
           .collection("telegramUsers")
-          .doc(CustomerKey)
+          .doc(userId)
           .collection("orders")
-          .doc(OrderId)
-          .update({
-            rebillId: RebillId,
-            tinkoffNotification: notification,
-            notifiedAt: admin.firestore.FieldValue.serverTimestamp()
-          });
+          .doc(OrderId);
+        
+        const orderDoc = await orderRef.get();
+        
+        if (!orderDoc.exists) {
+          console.log(`⚠️ Заказ ${OrderId} не найден у пользователя ${userId}, ищем по всей БД`);
+          userId = null;
+        }
+      }
 
-        console.log(`💾 RebillId ${RebillId} saved for order ${OrderId}`);
+      // Если userId не найден или заказ не найден, ищем по всей БД
+      if (!userId) {
+        const foundOrder = await findOrderByOrderId(OrderId);
+        
+        if (foundOrder) {
+          userId = foundOrder.userId;
+          orderRef = foundOrder.orderRef;
+        }
+      }
+
+      // Если нашли заказ, обновляем его
+      if (userId && orderRef) {
+        const updateData = {
+          tinkoffNotification: notification,
+          notifiedAt: admin.firestore.FieldValue.serverTimestamp()
+        };
+
+        // Добавляем RebillId если он есть
+        if (RebillId) {
+          updateData.rebillId = RebillId;
+          console.log(`💾 Сохраняем RebillId ${RebillId} для заказа ${OrderId}`);
+        }
+
+        await orderRef.update(updateData);
+        console.log(`✅ Заказ ${OrderId} успешно обновлен для пользователя ${userId}`);
+      } else {
+        console.log(`❌ Не удалось найти заказ ${OrderId} для обновления`);
+        
+        // Создаем запись в логе необработанных вебхуков
+        await db.collection("unprocessedWebhooks").add({
+          orderId: OrderId,
+          paymentId: PaymentId,
+          rebillId: RebillId,
+          customerKey: customerKey,
+          notification: notification,
+          receivedAt: admin.firestore.FieldValue.serverTimestamp()
+        });
       }
 
       // Тут можно добавить логику для отправки уведомлений пользователю
       // или обновления баланса
+    } else {
+      console.log(`ℹ️ Вебхук получен, но статус не CONFIRMED:`, notification.Status);
     }
 
     // Всегда возвращаем успешный ответ Tinkoff
