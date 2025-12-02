@@ -149,19 +149,26 @@ router.post("/debug-payment", async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// === Рекуррентное списание по RebillId ===
+// === Рекуррентное списание по RebillId (MIT COF Recurring) ===
 router.post("/recurrent-charge", async (req, res) => {
   try {
     const { userId, rebillId, amount, description } = req.body;
-    if (!userId || !rebillId || !amount || !description) return res.status(400).json({ error: "Missing params" });
+    if (!userId || !rebillId || !amount || !description)
+      return res.status(400).json({ error: "Missing params" });
 
     const amountKop = Math.round(amount * 100);
     const orderId = `RC-${Date.now()}-${Math.floor(Math.random() * 9000 + 1000)}`.slice(0, 36);
 
+    // Генерация токена с OperationInitiatorType
     const token = generateTinkoffTokenInit({
-      Amount: amountKop, CustomerKey: userId, Description: description,
-      OrderId: orderId, RebillId: rebillId, PayType: "O",
-      NotificationURL: NOTIFICATION_URL
+      Amount: amountKop,
+      CustomerKey: userId,
+      Description: description,
+      OrderId: orderId,
+      RebillId: rebillId,
+      PayType: "O",
+      NotificationURL: NOTIFICATION_URL,
+      OperationInitiatorType: "R" // ключевой параметр для MIT COF
     });
 
     const payload = {
@@ -169,24 +176,34 @@ router.post("/recurrent-charge", async (req, res) => {
       Amount: amountKop,
       OrderId: orderId,
       RebillId: rebillId,
-      Token: token,
-      Description: description,
       CustomerKey: userId,
-      NotificationURL: NOTIFICATION_URL
+      Description: description,
+      NotificationURL: NOTIFICATION_URL,
+      OperationInitiatorType: "R",
+      Token: token
     };
 
     const data = await postTinkoff("Rebill", payload);
     if (!data.Success) return res.status(400).json(data);
 
+    // Сохраняем новый заказ в Firestore
     await db.collection("telegramUsers").doc(userId).collection("orders").doc(orderId).set({
-      orderId, amountKop, currency: "RUB", description,
-      tinkoff: { ...data }, rebillId, recurrent: "Y",
-      notificationUrl: NOTIFICATION_URL, customerKey: userId,
+      orderId,
+      amountKop,
+      currency: "RUB",
+      description,
+      tinkoff: { ...data },
+      rebillId,
+      recurrent: "Y",
+      notificationUrl: NOTIFICATION_URL,
+      customerKey: userId,
       createdAt: admin.firestore.FieldValue.serverTimestamp()
     });
 
     res.json({ ...data, rebillId, notificationUrl: NOTIFICATION_URL });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // === Вебхук Tinkoff ===
