@@ -12,7 +12,7 @@ const TINKOFF_PASSWORD = "rlkzhollw74x8uvv";
 const TINKOFF_API_URL = "https://securepay.tinkoff.ru/v2";
 const NOTIFICATION_URL = "https://astro-1-nns5.onrender.com/api/webhook";
 
-// === Генерация токена Init (стандартная) ===
+// === Генерация токена Init (для обычных и рекуррентных платежей) ===
 function generateTinkoffTokenInit({
   Amount,
   CustomerKey,
@@ -87,39 +87,6 @@ function generateTinkoffTokenFinish({ Amount, OrderId, PaymentId, NotificationUR
   return crypto.createHash("sha256").update(raw, "utf8").digest("hex");
 }
 
-// === Генерация токена для рекуррентного платежа ===
-function generateTinkoffTokenRecurrent({
-  Amount,
-  OrderId,
-  RebillId,
-  Description,
-  NotificationURL
-}) {
-  const params = [
-    { key: "Amount", value: Amount.toString() },
-    { key: "Description", value: Description },
-    { key: "OrderId", value: OrderId },
-    { key: "Password", value: TINKOFF_PASSWORD },
-    { key: "RebillId", value: RebillId },
-    { key: "TerminalKey", value: TINKOFF_TERMINAL_KEY }
-  ];
-
-  // Добавляем NotificationURL в токен, если он есть
-  if (NotificationURL && NotificationURL.trim() !== "") {
-    params.push({ key: "NotificationURL", value: NotificationURL });
-  }
-
-  // Сортируем по алфавиту по ключу
-  params.sort((a, b) => a.key.localeCompare(b.key));
-
-  // Конкатенируем значения
-  const raw = params.map(p => p.value).join("");
-  console.log("🔐 Token Recurrent RAW:", raw);
-  console.log("🔐 Token Recurrent params:", params);
-
-  return crypto.createHash("sha256").update(raw, "utf8").digest("hex");
-}
-
 // === Получение RebillId через GetState ===
 async function getTinkoffState(paymentId) {
   const payload = {
@@ -144,7 +111,7 @@ async function getTinkoffState(paymentId) {
 
 // === POST к Tinkoff API ===
 async function postTinkoff(method, payload) {
-  console.log(`📤 Tinkoff request: ${method}`, JSON.stringify(payload, null, 2));
+  console.log(`📤 Tinkoff request: ${method}`, payload);
 
   const resp = await fetch(`${TINKOFF_API_URL}/${method}`, {
     method: "POST",
@@ -219,25 +186,46 @@ router.post("/charge-recurrent", async (req, res) => {
     const orderId = `RCR-${Date.now()}-${Math.floor(Math.random() * 9000 + 1000)}`.slice(0, 36);
 
     // Генерируем токен для рекуррентного платежа
-    const token = generateTinkoffTokenRecurrent({
+    // Важно: используем ТОЧНО ТУ ЖЕ ЛОГИКУ, что и для обычного Init
+    const token = generateTinkoffTokenInit({
       Amount: amountKop,
-      OrderId: orderId,
-      RebillId: rebillId,
+      CustomerKey: userId,
       Description: description,
+      OrderId: orderId,
+      RebillId: rebillId, // Добавляем RebillId в токен!
+      Recurrent: "Y", // Указываем, что это рекуррентный платеж
+      PayType: "O",
+      Language: "ru",
       NotificationURL: NOTIFICATION_URL
     });
 
     // Подготавливаем запрос для рекуррентного платежа
-    // ВАЖНО: Для рекуррентного платежа CustomerKey может быть не нужен или нужен
-    // Сначала попробуем без CustomerKey
+    // ВАЖНО: Порядок полей должен быть как в документации Tinkoff
     const payload = {
       TerminalKey: TINKOFF_TERMINAL_KEY,
       Amount: amountKop,
       OrderId: orderId,
-      Token: token,
       Description: description,
-      RebillId: rebillId,
-      NotificationURL: NOTIFICATION_URL
+      CustomerKey: userId,
+      Recurrent: "Y", // Обязательно указываем для рекуррентных платежей
+      PayType: "O", // One-click оплата
+      Language: "ru",
+      RebillId: rebillId, // Ключевой параметр для рекуррентного списания
+      Token: token,
+      NotificationURL: NOTIFICATION_URL,
+      Receipt: {
+        Email: "test@example.com",
+        Taxation: "usn_income",
+        Items: [
+          {
+            Name: description,
+            Price: amountKop,
+            Quantity: 1,
+            Amount: amountKop,
+            Tax: "none"
+          }
+        ]
+      }
     };
 
     console.log("💰 Инициируем рекуррентный платеж:", {
@@ -254,53 +242,12 @@ router.post("/charge-recurrent", async (req, res) => {
     // Обрабатываем ответ
     if (!data.Success) {
       console.error("❌ Ошибка рекуррентного списания:", data);
-      
-      // Попробуем с CustomerKey, если без него не получилось
-      if (data.ErrorCode === '204') {
-        console.log("🔄 Пробуем с CustomerKey...");
-        
-        // Генерируем токен с CustomerKey
-        const tokenWithCustomerKey = generateTinkoffTokenRecurrent({
-          Amount: amountKop,
-          OrderId: orderId,
-          RebillId: rebillId,
-          Description: description,
-          NotificationURL: NOTIFICATION_URL,
-          CustomerKey: userId
-        });
-
-        const payloadWithCustomerKey = {
-          TerminalKey: TINKOFF_TERMINAL_KEY,
-          Amount: amountKop,
-          OrderId: orderId,
-          Token: tokenWithCustomerKey,
-          Description: description,
-          RebillId: rebillId,
-          CustomerKey: userId,
-          NotificationURL: NOTIFICATION_URL
-        };
-
-        const dataWithCustomerKey = await postTinkoff("Init", payloadWithCustomerKey);
-        
-        if (!dataWithCustomerKey.Success) {
-          return res.status(400).json({
-            error: "Recurrent charge failed",
-            tinkoffResponse: dataWithCustomerKey,
-            details: dataWithCustomerKey.Message || "Unknown error",
-            triedWithCustomerKey: true
-          });
-        }
-        
-        // Успех с CustomerKey
-        data = dataWithCustomerKey;
-      } else {
-        return res.status(400).json({
-          error: "Recurrent charge failed",
-          tinkoffResponse: data,
-          details: data.Message || "Unknown error",
-          triedWithCustomerKey: false
-        });
-      }
+      return res.status(400).json({
+        error: "Recurrent charge failed",
+        tinkoffResponse: data,
+        details: data.Message || "Unknown error",
+        errorCode: data.ErrorCode
+      });
     }
 
     // Сохраняем информацию о рекуррентном платеже в Firestore
@@ -349,6 +296,7 @@ router.post("/charge-recurrent", async (req, res) => {
         recurrent: "Y",
         payType: "O",
         notificationUrl: NOTIFICATION_URL,
+        customerKey: userId,
         createdAt: admin.firestore.FieldValue.serverTimestamp()
       });
 
@@ -376,109 +324,6 @@ router.post("/charge-recurrent", async (req, res) => {
       error: err.message,
       details: "Failed to initiate recurrent charge"
     });
-  }
-});
-
-// === Альтернативный endpoint для рекуррентного платежа (более простой) ===
-router.post("/charge-recurrent-simple", async (req, res) => {
-  try {
-    const { userId, amount, description, rebillId } = req.body;
-
-    if (!userId || !amount || !description || !rebillId) {
-      return res.status(400).json({ 
-        error: "Missing required parameters" 
-      });
-    }
-
-    const amountKop = Math.round(amount * 100);
-    const orderId = `RCR-${Date.now()}-${Math.floor(Math.random() * 9000 + 1000)}`.slice(0, 36);
-
-    // Генерируем токен по стандартной схеме Init
-    const token = generateTinkoffTokenInit({
-      Amount: amountKop,
-      CustomerKey: userId,
-      Description: description,
-      OrderId: orderId,
-      RebillId: rebillId,
-      Recurrent: "Y",
-      PayType: "O",
-      Language: "ru",
-      NotificationURL: NOTIFICATION_URL
-    });
-
-    const payload = {
-      TerminalKey: TINKOFF_TERMINAL_KEY,
-      Amount: amountKop,
-      OrderId: orderId,
-      Token: token,
-      Description: description,
-      CustomerKey: userId,
-      RebillId: rebillId,
-      Recurrent: "Y",
-      PayType: "O",
-      Language: "ru",
-      NotificationURL: NOTIFICATION_URL,
-      Receipt: {
-        Email: "test@example.com",
-        Taxation: "usn_income",
-        Items: [
-          {
-            Name: description,
-            Price: amountKop,
-            Quantity: 1,
-            Amount: amountKop,
-            Tax: "none"
-          }
-        ]
-      }
-    };
-
-    console.log("💰 Инициируем рекуррентный платеж (simple):", {
-      userId,
-      orderId,
-      rebillId,
-      amount
-    });
-
-    const data = await postTinkoff("Init", payload);
-
-    if (!data.Success) {
-      return res.status(400).json({
-        error: "Recurrent charge failed",
-        tinkoffResponse: data
-      });
-    }
-
-    // Сохраняем в Firestore
-    await db
-      .collection("telegramUsers")
-      .doc(userId)
-      .collection("recurrentPayments")
-      .doc(orderId)
-      .set({
-        orderId,
-        userId,
-        amountKop,
-        amount,
-        description,
-        rebillId,
-        tinkoff: data,
-        status: "initiated",
-        createdAt: admin.firestore.FieldValue.serverTimestamp()
-      });
-
-    res.json({
-      success: true,
-      message: "Recurrent charge initiated",
-      orderId,
-      paymentId: data.PaymentId,
-      status: data.Status,
-      rebillId
-    });
-
-  } catch (err) {
-    console.error("❌ /charge-recurrent-simple error:", err);
-    res.status(500).json({ error: err.message });
   }
 });
 
