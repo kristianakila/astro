@@ -246,65 +246,6 @@ router.post("/finish-authorize", async (req, res) => {
   }
 });
 
-// === Проверка состояния платежа и получение RebillId ===
-router.post("/check-payment", async (req, res) => {
-  try {
-    const { paymentId } = req.body;
-    
-    if (!paymentId) {
-      return res.status(400).json({ error: "Missing paymentId" });
-    }
-
-    const rebillId = await getTinkoffState(paymentId);
-
-    res.json({
-      paymentId,
-      rebillId,
-      hasRebill: !!rebillId
-    });
-  } catch (err) {
-    console.error("❌ /check-payment error:", err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// === Полная проверка платежа ===
-router.post("/debug-payment", async (req, res) => {
-  try {
-    const { paymentId } = req.body;
-
-    const payload = {
-      TerminalKey: TINKOFF_TERMINAL_KEY,
-      PaymentId: paymentId
-    };
-
-    const raw = `${payload.PaymentId}${TINKOFF_PASSWORD}${TINKOFF_TERMINAL_KEY}`;
-    payload.Token = crypto.createHash("sha256").update(raw, "utf8").digest("hex");
-
-    const resp = await fetch(`${TINKOFF_API_URL}/GetState`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload)
-    });
-
-    const data = await resp.json();
-
-    res.json({
-      paymentId,
-      status: data.Status,
-      success: data.Success,
-      errorCode: data.ErrorCode,
-      errorMessage: data.Message,
-      rebillId: data.RebillId || data.PaymentData?.RebillId,
-      cardId: data.CardId,
-      pan: data.Pan,
-      fullResponse: data
-    });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
 // === Обработчик вебхука от Tinkoff ===
 router.post("/webhook", async (req, res) => {
   try {
