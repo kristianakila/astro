@@ -5,6 +5,11 @@ import tinkoffRouter from "./routes/tinkoff.js";
 const app = express();
 app.use(cors());
 app.use(express.json());
+app.use((req, res, next) => {
+  console.log("📥 Incoming body:", req.body);
+  next();
+});
+
 
 // === Health-check ===
 app.get("/health", (req, res) => {
