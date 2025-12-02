@@ -31,6 +31,7 @@ function generateTinkoffTokenInit({
     { key: "TerminalKey", value: TINKOFF_TERMINAL_KEY }
   ];
 
+  // Добавляем опциональные параметры
   if (RebillId && RebillId.trim() !== "") {
     params.push({ key: "RebillId", value: RebillId });
   }
@@ -47,12 +48,53 @@ function generateTinkoffTokenInit({
     params.push({ key: "Language", value: Language });
   }
 
+  // Сортируем по алфавиту по ключу
   params.sort((a, b) => a.key.localeCompare(b.key));
 
+  // Конкатенируем значения
   const raw = params.map(p => p.value).join("");
   console.log("🔐 Token Init RAW:", raw);
 
   return crypto.createHash("sha256").update(raw, "utf8").digest("hex");
+}
+
+// === Генерация токена FinishAuthorize ===
+function generateTinkoffTokenFinish({ Amount, OrderId, PaymentId }) {
+  const params = [
+    { key: "Amount", value: Amount.toString() },
+    { key: "OrderId", value: OrderId },
+    { key: "Password", value: TINKOFF_PASSWORD },
+    { key: "PaymentId", value: PaymentId },
+    { key: "TerminalKey", value: TINKOFF_TERMINAL_KEY }
+  ];
+
+  params.sort((a, b) => a.key.localeCompare(b.key));
+  const raw = params.map(p => p.value).join("");
+  console.log("🔐 Token FinishAuthorize RAW:", raw);
+
+  return crypto.createHash("sha256").update(raw, "utf8").digest("hex");
+}
+
+// === Получение RebillId через GetState ===
+async function getTinkoffState(paymentId) {
+  const payload = {
+    TerminalKey: TINKOFF_TERMINAL_KEY,
+    PaymentId: paymentId
+  };
+
+  const raw = `${payload.PaymentId}${TINKOFF_PASSWORD}${TINKOFF_TERMINAL_KEY}`;
+  payload.Token = crypto.createHash("sha256").update(raw, "utf8").digest("hex");
+
+  const resp = await fetch(`${TINKOFF_API_URL}/GetState`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload)
+  });
+
+  const data = await resp.json();
+  console.log("📥 Tinkoff GetState response:", data);
+
+  return data.PaymentData?.RebillId || null;
 }
 
 // === POST к Tinkoff API ===
@@ -71,32 +113,24 @@ async function postTinkoff(method, payload) {
   return data;
 }
 
-// ==========================================================================================
-// === INIT ПЛАТЕЖА ==========================================================================
-// ==========================================================================================
-
+// === Init платежа ===
 router.post("/init", async (req, res) => {
   try {
     const { amount, userId, description, recurrent = "Y" } = req.body;
 
     if (!amount || !userId || !description) {
-      return res
-        .status(400)
-        .json({ error: "Missing amount, userId or description" });
+      return res.status(400).json({ error: "Missing amount, userId, description" });
     }
 
     const amountKop = Math.round(amount * 100);
-
-    const orderId = `ORD-${Date.now()}-${Math.floor(
-      1000 + Math.random() * 9000
-    )}`.slice(0, 36);
+    const orderId = `ORD-${Date.now()}-${Math.floor(Math.random() * 9000 + 1000)}`.slice(0, 36);
 
     const token = generateTinkoffTokenInit({
       Amount: amountKop,
       CustomerKey: userId,
       Description: description,
       OrderId: orderId,
-      RebillId: "",
+      RebillId: "", // пусто для новой рекуррентной операции
       Recurrent: recurrent,
       PayType: "O",
       Language: "ru"
@@ -110,10 +144,8 @@ router.post("/init", async (req, res) => {
       Description: description,
       CustomerKey: userId,
       Recurrent: recurrent,
-      PayType: "O",
+      PayType: "O", // One-click оплата (обязательно для рекуррента)
       Language: "ru",
-      NotificationURL:
-        "https://astro-1-nns5.onrender.com/api/tinkoff/webhook",
       Receipt: {
         Email: "test@example.com",
         Taxation: "usn_income",
@@ -130,12 +162,9 @@ router.post("/init", async (req, res) => {
     };
 
     const data = await postTinkoff("Init", payload);
+    if (!data.Success) return res.status(400).json(data);
 
-    if (!data.Success) {
-      console.log("❌ Tinkoff Init error:", data);
-      return res.status(400).json(data);
-    }
-
+    // Сохраняем заказ в Firestore
     await db
       .collection("telegramUsers")
       .doc(userId)
@@ -146,17 +175,14 @@ router.post("/init", async (req, res) => {
         amountKop,
         currency: "RUB",
         description,
-        tinkoff: {
-          PaymentId: data.PaymentId,
-          PaymentURL: data.PaymentURL
-        },
+        tinkoff: { PaymentId: data.PaymentId, PaymentURL: data.PaymentURL },
         rebillId: null,
-        recurrent,
+        recurrent: recurrent,
         payType: "O",
         createdAt: admin.firestore.FieldValue.serverTimestamp()
       });
 
-    return res.json({
+    res.json({
       PaymentURL: data.PaymentURL,
       PaymentId: data.PaymentId,
       orderId,
@@ -169,21 +195,136 @@ router.post("/init", async (req, res) => {
   }
 });
 
-// ==========================================================================================
-// === ВЕБХУК ТИНЬКОФФ ======================================================================
-// ==========================================================================================
+// === FinishAuthorize платежа ===
+router.post("/finish-authorize", async (req, res) => {
+  try {
+    const { userId, orderId, paymentId, amount, description } = req.body;
+    
+    if (!userId || !orderId || !paymentId || !amount || !description) {
+      return res.status(400).json({ error: "Missing params" });
+    }
 
+    const amountKop = Math.round(amount * 100);
+
+    const token = generateTinkoffTokenFinish({
+      Amount: amountKop,
+      OrderId: orderId,
+      PaymentId: paymentId
+    });
+
+    const payload = {
+      TerminalKey: TINKOFF_TERMINAL_KEY,
+      PaymentId: paymentId,
+      Amount: amountKop,
+      OrderId: orderId,
+      Description: description,
+      Token: token
+    };
+
+    const data = await postTinkoff("FinishAuthorize", payload);
+    if (!data.Success) return res.status(400).json(data);
+
+    // Получаем RebillId после первой оплаты
+    const rebillId = await getTinkoffState(paymentId);
+
+    // Обновляем заказ в Firestore
+    await db
+      .collection("telegramUsers")
+      .doc(userId)
+      .collection("orders")
+      .doc(orderId)
+      .update({
+        tinkoff: { ...data },
+        rebillId,
+        finishedAt: admin.firestore.FieldValue.serverTimestamp()
+      });
+
+    res.json({ ...data, rebillId });
+  } catch (err) {
+    console.error("❌ /finish-authorize error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// === Проверка состояния платежа и получение RebillId ===
+router.post("/check-payment", async (req, res) => {
+  try {
+    const { paymentId } = req.body;
+    
+    if (!paymentId) {
+      return res.status(400).json({ error: "Missing paymentId" });
+    }
+
+    const rebillId = await getTinkoffState(paymentId);
+
+    res.json({
+      paymentId,
+      rebillId,
+      hasRebill: !!rebillId
+    });
+  } catch (err) {
+    console.error("❌ /check-payment error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// === Полная проверка платежа ===
+router.post("/debug-payment", async (req, res) => {
+  try {
+    const { paymentId } = req.body;
+
+    const payload = {
+      TerminalKey: TINKOFF_TERMINAL_KEY,
+      PaymentId: paymentId
+    };
+
+    const raw = `${payload.PaymentId}${TINKOFF_PASSWORD}${TINKOFF_TERMINAL_KEY}`;
+    payload.Token = crypto.createHash("sha256").update(raw, "utf8").digest("hex");
+
+    const resp = await fetch(`${TINKOFF_API_URL}/GetState`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+
+    const data = await resp.json();
+
+    res.json({
+      paymentId,
+      status: data.Status,
+      success: data.Success,
+      errorCode: data.ErrorCode,
+      errorMessage: data.Message,
+      rebillId: data.RebillId || data.PaymentData?.RebillId,
+      cardId: data.CardId,
+      pan: data.Pan,
+      fullResponse: data
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// === Обработчик вебхука от Tinkoff ===
 router.post("/webhook", async (req, res) => {
   try {
     const notification = req.body;
     console.log("📨 Tinkoff Webhook received:", notification);
 
+    // Проверяем подпись (опционально, но рекомендуется)
+    // const token = generateWebhookToken(notification);
+    // if (token !== notification.Token) {
+    //   return res.status(401).json({ error: "Invalid signature" });
+    // }
+
+    // Проверяем успешность платежа
     if (notification.Success && notification.Status === "CONFIRMED") {
-      const { OrderId, RebillId, CustomerKey } = notification;
+      const { OrderId, PaymentId, RebillId, CustomerKey } = notification;
 
       console.log("✅ Payment confirmed! RebillId:", RebillId);
 
       if (RebillId) {
+        // Сохраняем RebillId в Firestore
         await db
           .collection("telegramUsers")
           .doc(CustomerKey)
@@ -197,13 +338,41 @@ router.post("/webhook", async (req, res) => {
 
         console.log(`💾 RebillId ${RebillId} saved for order ${OrderId}`);
       }
+
+      // Тут можно добавить логику для отправки уведомлений пользователю
+      // или обновления баланса
     }
 
+    // Всегда возвращаем успешный ответ Tinkoff
     res.json({ Success: true });
+
   } catch (err) {
     console.error("❌ Webhook error:", err);
+    // Все равно возвращаем успех, чтобы Tinkoff не отправлял повторно
     res.json({ Success: true });
   }
 });
+
+// === Генерация токена для вебхука (для проверки подписи) ===
+function generateWebhookToken(notification) {
+  const params = [
+    { key: "Amount", value: notification.Amount.toString() },
+    { key: "OrderId", value: notification.OrderId },
+    { key: "Password", value: TINKOFF_PASSWORD },
+    { key: "PaymentId", value: notification.PaymentId },
+    { key: "Status", value: notification.Status },
+    { key: "TerminalKey", value: notification.TerminalKey }
+  ];
+
+  // Если есть дополнительные поля
+  if (notification.RebillId) {
+    params.push({ key: "RebillId", value: notification.RebillId });
+  }
+
+  params.sort((a, b) => a.key.localeCompare(b.key));
+  const raw = params.map(p => p.value).join("");
+
+  return crypto.createHash("sha256").update(raw, "utf8").digest("hex");
+}
 
 export default router;
