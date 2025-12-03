@@ -5,6 +5,7 @@ import { db } from "../firebase.js";
 import fetch from "node-fetch";
 import crypto from "crypto";
 import admin from "firebase-admin";
+import TbankPayments from "tbank-payments";
 
 const router = express.Router();
 
@@ -14,34 +15,30 @@ const TINKOFF_PASSWORD = "rlkzhollw74x8uvv";
 const TINKOFF_API_URL = "https://securepay.tinkoff.ru/v2";
 const NOTIFICATION_URL = "https://astro-1-nns5.onrender.com/api/webhook";
 
+// === Инициализация TbankPayments SDK
+const tbank = new TbankPayments({
+  merchantId: TINKOFF_TERMINAL_KEY,
+  secret: TINKOFF_PASSWORD,
+  apiUrl: 'https://securepay.tinkoff.ru'
+});
+
 /* ============================================================
    🔐 Универсальная генерация токена Tinkoff (Init, Charge, др.)
    Token = SHA256( values(sortedKeys) + Password )
    ============================================================ */
 function generateTinkoffToken(params) {
-  // 1. Берём только root поля и исключаем Token
   const filtered = {};
   for (const key of Object.keys(params)) {
     if (key !== "Token" && params[key] !== undefined && params[key] !== null) {
       filtered[key] = params[key];
     }
   }
-
-  // 2. Добавляем Password в корень, как требует документация
   filtered["Password"] = TINKOFF_PASSWORD;
-
-  // 3. Сортировка ключей (строго по алфавиту)
   const sortedKeys = Object.keys(filtered).sort();
-
-  // 4. Конкатенация только значений
   const concatenated = sortedKeys.map((key) => `${filtered[key]}`).join("");
-
   console.log("🔐 Token string:", concatenated);
-
-  // 5. SHA-256
   return crypto.createHash("sha256").update(concatenated, "utf8").digest("hex");
 }
-
 
 /* ============================================================
    POST wrapper
@@ -65,7 +62,6 @@ async function getTinkoffState(paymentId) {
     PaymentId: paymentId,
     Token: token
   });
-
   return resp.PaymentData?.RebillId || null;
 }
 
@@ -79,7 +75,6 @@ async function findOrderByOrderId(orderId) {
       .doc(userDoc.id)
       .collection("orders")
       .doc(orderId);
-
     const orderDoc = await orderRef.get();
     if (orderDoc.exists) return { userId: userDoc.id, orderRef, orderData: orderDoc.data() };
   }
@@ -243,12 +238,9 @@ router.post("/debug-payment", async (req, res) => {
   }
 });
 
-// ============================================
-// /recurrent-charge — повторное списание с чеком
-// ============================================
-
-// ============================================
-// Создание чека для платежа
+/* ============================================================
+   Создание чека для recurrent-charge
+   ============================================================ */
 function createReceipt(email = 'client@example.com', amountKop = 10000, description = 'Продление подписки') {
   return {
     Email: email,
@@ -268,17 +260,12 @@ function createReceipt(email = 'client@example.com', amountKop = 10000, descript
   };
 }
 
-// ============================================
-// POST /recurrent-charge
+/* ============================================================
+   POST /recurrent-charge — повторное списание с чеком
+   ============================================================ */
 router.post("/recurrent-charge", async (req, res) => {
   try {
-    const {
-      userId,
-      rebillId,
-      amount,
-      description = 'Повторное списание',
-      email = 'client@example.com'
-    } = req.body;
+    const { userId, rebillId, amount, description = 'Повторное списание', email = 'client@example.com' } = req.body;
 
     if (!userId || !rebillId || !amount) {
       return res.status(400).json({ error: "Missing userId, rebillId, or amount" });
@@ -339,7 +326,6 @@ router.post("/recurrent-charge", async (req, res) => {
   }
 });
 
-
 /* ============================================================
    Webhook
    ============================================================ */
@@ -348,40 +334,35 @@ router.post("/webhook", async (req, res) => {
     const n = req.body;
     console.log("📨 Webhook:", n);
 
-    if (n.Success && n.Status === "CONFIRMED") {
-      let userId = n.CustomerKey || n.customerKey;
-      let orderRef = userId
-        ? db.collection("telegramUsers").doc(userId).collection("orders").doc(n.OrderId)
-        : null;
+    let userId = n.CustomerKey || n.customerKey;
+    let orderRef = userId ? db.collection("telegramUsers").doc(userId).collection("orders").doc(n.OrderId) : null;
+    let orderDoc = orderRef ? await orderRef.get() : null;
 
-      let orderDoc = orderRef ? await orderRef.get() : null;
-
-      if (!orderDoc?.exists) {
-        const found = await findOrderByOrderId(n.OrderId);
-        if (found) {
-          userId = found.userId;
-          orderRef = found.orderRef;
-        }
+    if (!orderDoc?.exists) {
+      const found = await findOrderByOrderId(n.OrderId);
+      if (found) {
+        userId = found.userId;
+        orderRef = found.orderRef;
       }
+    }
 
-      if (userId && orderRef) {
-        const updateData = {
-          tinkoffNotification: n,
-          notifiedAt: admin.firestore.FieldValue.serverTimestamp()
-        };
-        if (n.RebillId) updateData.rebillId = n.RebillId;
+    if (userId && orderRef) {
+      const updateData = {
+        tinkoffNotification: n,
+        notifiedAt: admin.firestore.FieldValue.serverTimestamp()
+      };
+      if (n.RebillId) updateData.rebillId = n.RebillId;
 
-        await orderRef.update(updateData);
-      } else {
-        await db.collection("unprocessedWebhooks").add({
-          orderId: n.OrderId,
-          paymentId: n.PaymentId,
-          rebillId: n.RebillId,
-          customerKey: userId,
-          notification: n,
-          receivedAt: admin.firestore.FieldValue.serverTimestamp()
-        });
-      }
+      await orderRef.update(updateData);
+    } else {
+      await db.collection("unprocessedWebhooks").add({
+        orderId: n.OrderId,
+        paymentId: n.PaymentId,
+        rebillId: n.RebillId,
+        customerKey: userId,
+        notification: n,
+        receivedAt: admin.firestore.FieldValue.serverTimestamp()
+      });
     }
 
     res.json({ Success: true });
