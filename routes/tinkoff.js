@@ -245,11 +245,11 @@ router.post("/debug-payment", async (req, res) => {
 });
 
 /* ============================================================
-   🔥 Recurrent Charge (MIT) — версия через axios как в примере
+   🔥 Recurrent Charge — улучшенная, устойчивая версия
    ============================================================ */
 router.post("/recurrent-charge", async (req, res) => {
   try {
-    const {
+    let {
       userId,
       paymentId,
       rebillId,
@@ -261,69 +261,93 @@ router.post("/recurrent-charge", async (req, res) => {
       infoEmail = ""
     } = req.body;
 
-    if (!userId || !paymentId || !rebillId)
-      return res.status(400).json({ error: "Missing params" });
+    if (!userId || !paymentId) return res.status(400).json({ error: "Missing userId or paymentId" });
 
-    const amountKop =
-      typeof amount === "number" ? Math.round(amount * 100) : undefined;
+    // если rebill не передан, попытаемся получить его через GetState
+    if (!rebillId) {
+      try {
+        rebillId = await getTinkoffState(paymentId);
+        console.log("🔎 Found rebillId via GetState:", rebillId);
+      } catch (e) {
+        console.warn("⚠️ getTinkoffState failed:", e.message);
+      }
+    }
 
-    const orderId =
-      clientOrderId ||
-      `RC-${Date.now()}-${Math.floor(Math.random() * 9000 + 1000)}`.slice(0, 36);
+    if (!rebillId) {
+      return res.status(400).json({ error: "Missing rebillId and could not fetch it from GetState" });
+    }
 
-    /* === Генерация токена: строго по алфавиту + Password === */
-    const tokenObj = {
-      ...(amountKop ? { Amount: amountKop } : {}),
-      CustomerKey: userId,
-      IP: ip,
-      InfoEmail: infoEmail,
-      OrderId: orderId,
-      PaymentId: paymentId,
-      RebillId: rebillId,
-      SendEmail: Boolean(sendEmail),
-      TerminalKey: TINKOFF_TERMINAL_KEY
-    };
+    const amountKop = typeof amount === "number" ? Math.round(amount * 100) : undefined;
 
-    const token = generateTinkoffToken(tokenObj);
+    const orderId = clientOrderId || `RC-${Date.now()}-${Math.floor(Math.random() * 9000 + 1000)}`.slice(0, 36);
 
-    /* === Payload в стиле примера axios === */
-    let data = JSON.stringify({
+    // Формируем payload для Charge только с реально существующими полями
+    const payload = {
       TerminalKey: TINKOFF_TERMINAL_KEY,
       PaymentId: paymentId,
       RebillId: rebillId,
-      Token: token,
-      ...(amountKop ? { Amount: amountKop } : {}),
       CustomerKey: userId,
-      OrderId: orderId,
-      ...(ip ? { IP: ip } : {}),
-      SendEmail: Boolean(sendEmail),
-      ...(infoEmail ? { InfoEmail: infoEmail } : {})
-    });
-
-    console.log("📦 Charge axios payload:", JSON.parse(data));
-
-    let config = {
-      method: "post",
-      maxBodyLength: Infinity,
-      url: `${TINKOFF_API_URL}/Charge`,
-      headers: {
-        "Content-Type": "application/json",
-        "Accept": "application/json"
-      },
-      data: data
+      OrderId: orderId
     };
 
-    const response = await axios.request(config);
+    if (typeof amountKop === "number") payload.Amount = amountKop;
+    if (ip) payload.IP = ip;
+    if (sendEmail) payload.SendEmail = true;
+    if (infoEmail && sendEmail) payload.InfoEmail = infoEmail;
 
-    console.log("📤 Charge response:", response.data);
+    // Генерация токена по тем же полям, что и payload (generateTinkoffToken фильтрует undefined)
+    const token = generateTinkoffToken(payload);
+    payload.Token = token;
 
-    if (!response.data.Success) {
+    console.log("📦 Charge payload (final):", payload);
+
+    const config = {
+      method: "post",
+      url: `${TINKOFF_API_URL}/Charge`,
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      data: JSON.stringify(payload),
+      maxBodyLength: Infinity,
+      timeout: 20000
+    };
+
+    let response;
+    try {
+      response = await axios.request(config);
+    } catch (err) {
+      console.error("❌ Axios request error for Charge:", err?.response?.status, err?.response?.data || err.message);
+      // если Tinkoff вернул HTTP 205 или другой код, отдаём тело ответа если есть
+      if (err?.response) {
+        return res.status(err.response.status || 500).json({
+          error: "Charge request failed at HTTP level",
+          status: err.response.status,
+          data: err.response.data
+        });
+      }
+      return res.status(500).json({ error: "Charge request failed", message: err.message });
+    }
+
+    const respData = response.data;
+    console.log("📤 Charge response:", respData);
+
+    // Если Tinkoff вернул Success=false — отдаём diagnostics и hint
+    if (!respData || respData.Success !== true) {
+      // Попытка помочь: если есть ErrorCode 205 — подсказка
+      const errorCode = respData?.ErrorCode ?? respData?.errorCode ?? null;
+      const hint = errorCode === 205 || errorCode === "205"
+        ? "Error 205 — возможно, RebillId не найден или недоступен. Проверьте, что RebillId корректен и что предыдущий платеж действительно сохранил RebillId."
+        : null;
+
       return res.status(400).json({
         error: "Charge failed",
-        tinkoff: response.data
+        tinkoff: respData,
+        diagnostics: {
+          attemptedPayload: payload,
+          hint
+        }
       });
     }
 
+    // Успешный рекуррентный платёж — сохраняем запись
     await db
       .collection("telegramUsers")
       .doc(userId)
@@ -334,15 +358,15 @@ router.post("/recurrent-charge", async (req, res) => {
         amountKop: amountKop ?? null,
         currency: "RUB",
         description: description || "recurrent charge",
-        tinkoff: response.data,
+        tinkoff: respData,
         rebillId,
         createdAt: admin.firestore.FieldValue.serverTimestamp()
       });
 
-    res.json({ ...response.data, rebillId });
+    return res.json({ ...respData, rebillId });
   } catch (err) {
-    console.error("❌ Charge MIT error:", err);
-    res.status(500).json({ error: err.message });
+    console.error("❌ Recurrent charge error (global):", err);
+    return res.status(500).json({ error: err.message || "Internal error" });
   }
 });
 
