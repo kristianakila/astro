@@ -43,6 +43,18 @@ function generateTinkoffToken(params) {
   return crypto.createHash("sha256").update(concatenated, "utf8").digest("hex");
 }
 
+function generateToken(params, secret) {
+  const rootParams = {};
+  for (const [key, value] of Object.entries(params)) {
+    if (key !== 'Token' && typeof value !== 'object' && value !== undefined) {
+      rootParams[key] = value;
+    }
+  }
+  rootParams.Password = secret;
+  const sortedKeys = Object.keys(rootParams).sort();
+  const concatenatedValues = sortedKeys.map((key) => rootParams[key]).join('');
+  return crypto.createHash('sha256').update(concatenatedValues, 'utf8').digest('hex');
+}
 
 /* ============================================================
    POST wrapper
