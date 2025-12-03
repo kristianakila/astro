@@ -87,87 +87,73 @@ async function findOrderByOrderId(orderId) {
 }
 
 /* ============================================================
-   Init / Recurrent unified
+   Init платежа
    ============================================================ */
 router.post("/init", async (req, res) => {
   try {
-    const { userId, amount, description, rebillId, sendEmail = false } = req.body;
-
-    if (!userId || !amount || (!description && !rebillId))
-      return res.status(400).json({ error: "Missing required fields" });
+    const { amount, userId, description, recurrent = "Y" } = req.body;
+    if (!amount || !userId || !description)
+      return res.status(400).json({ error: "Missing amount, userId, description" });
 
     const amountKop = Math.round(amount * 100);
     const orderId = `ORD-${Date.now()}-${Math.floor(Math.random() * 9000 + 1000)}`.slice(0, 36);
 
-    // --- Payload для Tinkoff ---
+    const token = generateTinkoffToken({
+      TerminalKey: TINKOFF_TERMINAL_KEY,
+      Amount: amountKop,
+      CustomerKey: userId,
+      Description: description,
+      OrderId: orderId,
+      NotificationURL: NOTIFICATION_URL,
+      Recurrent: recurrent,
+      PayType: "O",
+      Language: "ru"
+    });
+
     const payload = {
       TerminalKey: TINKOFF_TERMINAL_KEY,
       Amount: amountKop,
       OrderId: orderId,
+      Description: description,
       CustomerKey: userId,
+      Recurrent: recurrent,
+      PayType: "O",
+      Language: "ru",
       NotificationURL: NOTIFICATION_URL,
-      Recurrent: rebillId ? "Y" : "N",
-      PayType: rebillId ? "O" : undefined,
-      SendEmail: Boolean(sendEmail),
-      ...(rebillId ? { RebillId: rebillId } : {}),
-      ...(description && !rebillId ? { Description: description } : {}),
-      Token: "" // заполним ниже
+      Token: token,
+      Receipt: {
+        Email: "test@example.com",
+        Taxation: "usn_income",
+        Items: [
+          { Name: description, Price: amountKop, Quantity: 1, Amount: amountKop, Tax: "none" }
+        ]
+      }
     };
 
-    // --- Генерация токена ---
-    const tokenFields = { ...payload };
-    delete tokenFields.Token; // token не включаем в строку
-    tokenFields.Password = TINKOFF_PASSWORD;
+    const data = await postTinkoff("Init", payload);
+    if (!data.Success) return res.status(400).json(data);
 
-    const sortedKeys = Object.keys(tokenFields).sort();
-    const tokenString = sortedKeys.map(k => `${tokenFields[k]}`).join("");
-    const token = crypto.createHash("sha256").update(tokenString, "utf8").digest("hex");
-
-    payload.Token = token;
-
-    console.log("📦 Init/Recurrent payload:", payload);
-
-    // --- Отправка на Tinkoff ---
-    const response = await fetch(`${TINKOFF_API_URL}/Init`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload)
+    await db.collection("telegramUsers").doc(userId).collection("orders").doc(orderId).set({
+      orderId,
+      amountKop,
+      description,
+      tinkoff: { PaymentId: data.PaymentId, PaymentURL: data.PaymentURL },
+      rebillId: null,
+      recurrent,
+      notificationUrl: NOTIFICATION_URL,
+      createdAt: admin.firestore.FieldValue.serverTimestamp()
     });
-    const data = await response.json();
-
-    console.log("📤 Init/Recurrent response:", data);
-
-    if (!data.Success) return res.status(400).json({ error: "Init failed", tinkoff: data });
-
-    // --- Сохраняем в Firebase ---
-    await db.collection("telegramUsers")
-      .doc(userId)
-      .collection("orders")
-      .doc(orderId)
-      .set({
-        orderId,
-        amountKop,
-        description: description || "Recurrent charge",
-        tinkoff: { PaymentId: data.PaymentId, PaymentURL: data.PaymentURL },
-        rebillId: data.RebillId || rebillId || null,
-        recurrent: rebillId ? "Y" : "N",
-        notificationUrl: NOTIFICATION_URL,
-        createdAt: admin.firestore.FieldValue.serverTimestamp()
-      });
 
     res.json({
-      PaymentURL: data.PaymentURL || null,
+      PaymentURL: data.PaymentURL,
       PaymentId: data.PaymentId,
       orderId,
-      rebillId: data.RebillId || rebillId || null
+      rebillId: null
     });
-
   } catch (err) {
-    console.error("❌ Init/Recurrent error:", err);
     res.status(500).json({ error: err.message });
   }
 });
-
 
 /* ============================================================
    FinishAuthorize
