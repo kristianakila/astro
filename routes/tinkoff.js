@@ -15,8 +15,7 @@ const TINKOFF_API_URL = "https://securepay.tinkoff.ru/v2";
 const NOTIFICATION_URL = "https://astro-1-nns5.onrender.com/api/webhook";
 
 /* ============================================================
-   🔐 Универсальная генерация токена Tinkoff (Init, Charge, др.)
-   Token = SHA256( values(sortedKeys) + Password )
+   🔐 Универсальная генерация токена Tinkoff
    ============================================================ */
 function generateTinkoffToken(params) {
   const filtered = {};
@@ -39,43 +38,60 @@ function generateTinkoffToken(params) {
    POST wrapper
    ============================================================ */
 async function postTinkoff(method, payload) {
+  console.log(`📤 Sending ${method}:`, JSON.stringify(payload, null, 2));
   const resp = await fetch(`${TINKOFF_API_URL}/${method}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload)
   });
-  return await resp.json();
+  const result = await resp.json();
+  console.log(`📥 Response ${method}:`, JSON.stringify(result, null, 2));
+  return result;
 }
 
 /* ============================================================
-   Создание чека для рекуррентного платежа
+   Генерация токена для метода Charge (ОСОБЫЙ СЛУЧАЙ!)
+   В Charge используются ТОЛЬКО: TerminalKey, PaymentId, RebillId
    ============================================================ */
-function createReceipt(email = 'test@example.com', amountKop, description = 'Продление подписки') {
-  return {
-    Email: email,
-    Phone: '+79001234567',
-    Taxation: 'osn',
-    Items: [
-      {
-        Name: description,
-        Price: amountKop,
-        Quantity: 1,
-        Amount: amountKop,
-        Tax: 'vat20',
-        PaymentMethod: 'full_payment',
-        PaymentObject: 'service'
-      }
-    ]
+function generateChargeToken(paymentId, rebillId) {
+  const params = {
+    TerminalKey: TINKOFF_TERMINAL_KEY,
+    PaymentId: paymentId,
+    RebillId: rebillId,
+    Password: TINKOFF_PASSWORD
   };
+  
+  const sortedKeys = Object.keys(params).sort();
+  const concatenated = sortedKeys.map((key) => `${params[key]}`).join("");
+  
+  console.log("🔐 Charge Token string:", concatenated);
+  
+  return crypto.createHash("sha256").update(concatenated, "utf8").digest("hex");
 }
 
 /* ============================================================
-   Проведение рекуррентного платежа по RebillId
-   (В ТОЧНОСТИ как в рабочем примере)
+   Генерация токена для метода Init
+   ============================================================ */
+function generateInitToken(params) {
+  const paramsWithPassword = {
+    ...params,
+    Password: TINKOFF_PASSWORD
+  };
+  
+  const sortedKeys = Object.keys(paramsWithPassword).sort();
+  const concatenated = sortedKeys.map((key) => `${paramsWithPassword[key]}`).join("");
+  
+  console.log("🔐 Init Token string:", concatenated);
+  
+  return crypto.createHash("sha256").update(concatenated, "utf8").digest("hex");
+}
+
+/* ============================================================
+   Проведение рекуррентного платежа
    ============================================================ */
 router.post("/recurrent-charge", async (req, res) => {
   try {
-    const { rebillId, amount, description = 'Автоматическое списание по подписке', email = 'test@example.com' } = req.body;
+    const { rebillId, amount, description = 'Автоматическое списание по подписке' } = req.body;
 
     if (!rebillId || !amount) {
       return res.status(400).json({ 
@@ -87,11 +103,31 @@ router.post("/recurrent-charge", async (req, res) => {
     const amountKop = Math.round(amount * 100);
     const orderId = 'recurrent-' + Date.now();
 
-    // 1. СОЗДАНИЕ ЧЕКА (как в примере)
-    const receipt = createReceipt(email, amountKop, description);
+    console.log("🚀 Starting recurrent charge:");
+    console.log("   RebillId:", rebillId);
+    console.log("   Amount:", amountKop, "kop");
+    console.log("   OrderId:", orderId);
 
-    // 2. ИНИЦИАЛИЗАЦИЯ ПЛАТЕЖА (БЕЗ RebillId!)
-    const initToken = generateTinkoffToken({
+    // 1. СОЗДАЕМ ЧЕК
+    const receipt = {
+      Email: 'test@example.com',
+      Phone: '+79001234567',
+      Taxation: 'osn',
+      Items: [
+        {
+          Name: description,
+          Price: amountKop,
+          Quantity: 1,
+          Amount: amountKop,
+          Tax: 'vat20',
+          PaymentMethod: 'full_payment',
+          PaymentObject: 'service'
+        }
+      ]
+    };
+
+    // 2. ИНИЦИАЛИЗИРУЕМ ПЛАТЕЖ (Init)
+    const initToken = generateInitToken({
       TerminalKey: TINKOFF_TERMINAL_KEY,
       Amount: amountKop,
       OrderId: orderId,
@@ -110,8 +146,7 @@ router.post("/recurrent-charge", async (req, res) => {
       Receipt: receipt
     };
 
-    console.log("🔄 Init payload:", JSON.stringify(initPayload, null, 2));
-
+    console.log("📝 Step 1: Calling Init...");
     const initResponse = await postTinkoff("Init", initPayload);
     
     if (!initResponse.Success) {
@@ -122,15 +157,16 @@ router.post("/recurrent-charge", async (req, res) => {
     }
 
     const newPaymentId = initResponse.PaymentId;
-    console.log("✅ New PaymentId:", newPaymentId);
+    console.log("✅ Init successful. New PaymentId:", newPaymentId);
 
-    // 3. СПИСАНИЕ ПО РЕКУРРЕНТУ (Charge)
-    const chargeToken = generateTinkoffToken({
-      TerminalKey: TINKOFF_TERMINAL_KEY,
-      PaymentId: newPaymentId,
-      RebillId: rebillId
-    });
-
+    // 3. ВЫПОЛНЯЕМ СПИСАНИЕ (Charge) - КЛЮЧЕВОЙ МОМЕНТ!
+    console.log("📝 Step 2: Calling Charge...");
+    console.log("   PaymentId:", newPaymentId);
+    console.log("   RebillId:", rebillId);
+    
+    // Для Charge используем ОСОБУЮ функцию генерации токена
+    const chargeToken = generateChargeToken(newPaymentId, rebillId);
+    
     const chargePayload = {
       TerminalKey: TINKOFF_TERMINAL_KEY,
       PaymentId: newPaymentId,
@@ -138,16 +174,12 @@ router.post("/recurrent-charge", async (req, res) => {
       Token: chargeToken
     };
 
-    console.log("💳 Charge payload:", JSON.stringify(chargePayload, null, 2));
-
     const chargeResponse = await postTinkoff("Charge", chargePayload);
     
-    if (!chargeResponse.Success) {
-      // Если Charge не удался, все равно проверяем статус
-      console.log("⚠️ Charge failed, checking status...");
-    }
+    console.log("💳 Charge response:", chargeResponse);
 
-    // 4. ПРОВЕРКА ФИНАЛЬНОГО СТАТУСА
+    // 4. ПРОВЕРЯЕМ СТАТУС (GetState)
+    console.log("📝 Step 3: Checking status...");
     const stateToken = generateTinkoffToken({
       TerminalKey: TINKOFF_TERMINAL_KEY,
       PaymentId: newPaymentId
@@ -159,26 +191,25 @@ router.post("/recurrent-charge", async (req, res) => {
       Token: stateToken
     });
 
-    // 5. ФОРМИРОВАНИЕ РЕЗУЛЬТАТА
+    // 5. ФОРМИРУЕМ РЕЗУЛЬТАТ
     const result = {
       success: chargeResponse.Success || false,
       paymentId: newPaymentId,
       rebillId: rebillId,
-      status: stateResponse.Status,
-      amount: stateResponse.Amount ? stateResponse.Amount / 100 : amountKop / 100,
+      status: stateResponse.Status || "UNKNOWN",
+      amount: amountKop / 100,
       orderId: orderId,
-      initResponse: initResponse,
       chargeResponse: chargeResponse,
       stateResponse: stateResponse
     };
 
-    // 6. СОХРАНЕНИЕ В FIRESTORE
+    // 6. СОХРАНЯЕМ
     await db.collection("recurrentCharges").doc(newPaymentId).set({
       ...result,
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
-      userId: req.body.userId || null
+      createdAt: admin.firestore.FieldValue.serverTimestamp()
     });
 
+    console.log("🎉 Recurrent charge completed:", result);
     res.json(result);
 
   } catch (err) {
@@ -191,9 +222,9 @@ router.post("/recurrent-charge", async (req, res) => {
 });
 
 /* ============================================================
-   Упрощенный endpoint для тестирования (точно как в примере)
+   Упрощенный тестовый endpoint
    ============================================================ */
-router.post("/recurrent-simple", async (req, res) => {
+router.post("/test-recurrent", async (req, res) => {
   try {
     const { rebillId, amount } = req.body;
     
@@ -202,16 +233,16 @@ router.post("/recurrent-simple", async (req, res) => {
     }
 
     const amountKop = Math.round(amount * 100);
-    const orderId = 'recurrent-' + Date.now();
+    const orderId = 'test-recurrent-' + Date.now();
 
-    // 1. Чек (обязательно!)
+    // 1. Init
     const receipt = {
       Email: 'test@example.com',
       Phone: '+79001234567',
       Taxation: 'osn',
       Items: [
         {
-          Name: 'Продление подписки',
+          Name: 'Тестовое списание',
           Price: amountKop,
           Quantity: 1,
           Amount: amountKop,
@@ -222,81 +253,61 @@ router.post("/recurrent-simple", async (req, res) => {
       ]
     };
 
-    // 2. Init
-    const initToken = generateTinkoffToken({
+    // Токен для Init
+    const initParams = {
       TerminalKey: TINKOFF_TERMINAL_KEY,
       Amount: amountKop,
       OrderId: orderId,
-      Description: 'Автоматическое списание по подписке',
+      Description: 'Тестовое рекуррентное списание',
       NotificationURL: NOTIFICATION_URL,
       Receipt: receipt
-    });
+    };
+    
+    const initToken = generateInitToken(initParams);
 
     const initResult = await postTinkoff("Init", {
-      TerminalKey: TINKOFF_TERMINAL_KEY,
-      Amount: amountKop,
-      OrderId: orderId,
-      Description: 'Автоматическое списание по подписке',
-      NotificationURL: NOTIFICATION_URL,
-      Token: initToken,
-      Receipt: receipt
+      ...initParams,
+      Token: initToken
     });
 
     if (!initResult.Success) {
-      return res.status(400).json({ error: "Init failed", details: initResult });
+      return res.status(400).json({ 
+        error: "Init failed", 
+        details: initResult 
+      });
     }
 
-    // 3. Charge
-    const chargeToken = generateTinkoffToken({
+    // 2. Charge - ВАЖНО: только 3 параметра!
+    const chargeParams = {
       TerminalKey: TINKOFF_TERMINAL_KEY,
       PaymentId: initResult.PaymentId,
       RebillId: rebillId
-    });
-
+    };
+    
+    const chargeToken = generateChargeToken(initResult.PaymentId, rebillId);
+    
     const chargeResult = await postTinkoff("Charge", {
-      TerminalKey: TINKOFF_TERMINAL_KEY,
-      PaymentId: initResult.PaymentId,
-      RebillId: rebillId,
+      ...chargeParams,
       Token: chargeToken
     });
 
-    // 4. GetState
-    const stateToken = generateTinkoffToken({
-      TerminalKey: TINKOFF_TERMINAL_KEY,
-      PaymentId: initResult.PaymentId
-    });
-
-    const finalStatus = await postTinkoff("GetState", {
-      TerminalKey: TINKOFF_TERMINAL_KEY,
-      PaymentId: initResult.PaymentId,
-      Token: stateToken
-    });
-
-    const result = {
-      success: chargeResult.Success,
+    res.json({
+      init: initResult,
+      charge: chargeResult,
       paymentId: initResult.PaymentId,
-      status: finalStatus.Status,
-      amount: finalStatus.Amount ? finalStatus.Amount / 100 : amountKop / 100,
-      orderId: orderId,
-      rebillId: rebillId
-    };
-
-    // Сохраняем
-    await db.collection("recurrentCharges").doc(initResult.PaymentId).set({
-      ...result,
-      createdAt: admin.firestore.FieldValue.serverTimestamp()
+      rebillId: rebillId,
+      amount: amount,
+      orderId: orderId
     });
-
-    res.json(result);
 
   } catch (err) {
-    console.error("Error:", err);
+    console.error("Test error:", err);
     res.status(500).json({ error: err.message });
   }
 });
 
 /* ============================================================
-   Остальной код без изменений
+   Остальной код (без изменений)
    ============================================================ */
 
 async function getTinkoffState(paymentId) {
@@ -324,9 +335,6 @@ async function findOrderByOrderId(orderId) {
   return null;
 }
 
-/* ============================================================
-   Init платежа
-   ============================================================ */
 router.post("/init", async (req, res) => {
   try {
     const { amount, userId, description, recurrent = "Y" } = req.body;
@@ -393,9 +401,6 @@ router.post("/init", async (req, res) => {
   }
 });
 
-/* ============================================================
-   FinishAuthorize
-   ============================================================ */
 router.post("/finish-authorize", async (req, res) => {
   try {
     const { userId, orderId, paymentId, amount, description } = req.body;
@@ -444,9 +449,6 @@ router.post("/finish-authorize", async (req, res) => {
   }
 });
 
-/* ============================================================
-   Check Payment
-   ============================================================ */
 router.post("/check-payment", async (req, res) => {
   try {
     const { paymentId } = req.body;
@@ -457,9 +459,6 @@ router.post("/check-payment", async (req, res) => {
   }
 });
 
-/* ============================================================
-   Debug Payment
-   ============================================================ */
 router.post("/debug-payment", async (req, res) => {
   try {
     const { paymentId } = req.body;
@@ -481,9 +480,6 @@ router.post("/debug-payment", async (req, res) => {
   }
 });
 
-/* ============================================================
-   Webhook
-   ============================================================ */
 router.post("/webhook", async (req, res) => {
   try {
     const n = req.body;
