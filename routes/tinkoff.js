@@ -247,20 +247,25 @@ router.post("/debug-payment", async (req, res) => {
 /* ============================================================
    🔥 Recurrent Charge (MIT) — версия через axios как в примере
    ============================================================ */
+/* ============================================================
+   🔥 Recurrent Charge с правильным токеном T-Bank
+   ============================================================ */
+import axios from "axios";
+
 router.post("/recurrent-charge", async (req, res) => {
   try {
     const {
       userId,
       paymentId,
       rebillId,
-      amount,
+      amount = 100, // рубли
       description = "Продление подписки",
       orderId: clientOrderId,
       ip,
       sendEmail = false,
       infoEmail = "",
       email = "client@example.com",
-      phone = "+79000000000",
+      phone = "+79001234567",
       taxation = "osn"
     } = req.body;
 
@@ -268,13 +273,13 @@ router.post("/recurrent-charge", async (req, res) => {
       return res.status(400).json({ error: "Missing required params" });
     }
 
-    const amountKop = typeof amount === "number" ? Math.round(amount * 100) : 10000;
+    const amountKop = Math.round(amount * 100);
 
     const orderId =
       clientOrderId ||
       `RC-${Date.now()}-${Math.floor(Math.random() * 9000 + 1000)}`.slice(0, 36);
 
-    // === Создаём чек ===
+    // === Создаём чек (Receipt) ===
     const receipt = {
       Email: email,
       Phone: phone,
@@ -292,8 +297,8 @@ router.post("/recurrent-charge", async (req, res) => {
       ]
     };
 
-    // === Генерация токена строго по алфавиту + Password ===
-    const tokenObj = {
+    // === Подготовка параметров для токена (только корневые поля, без объектов/массивов) ===
+    const tokenParams = {
       Amount: amountKop,
       CustomerKey: userId,
       IP: ip,
@@ -301,14 +306,14 @@ router.post("/recurrent-charge", async (req, res) => {
       OrderId: orderId,
       PaymentId: paymentId,
       RebillId: rebillId,
-      Receipt: receipt,
       SendEmail: Boolean(sendEmail),
       TerminalKey: TINKOFF_TERMINAL_KEY
     };
 
-    const token = generateTinkoffToken(tokenObj);
+    // === Генерация токена через T-Bank алгоритм ===
+    const token = generateToken(tokenParams, TINKOFF_PASSWORD);
 
-    // === Payload для Charge ===
+    // === Payload для запроса Charge ===
     const payload = {
       TerminalKey: TINKOFF_TERMINAL_KEY,
       PaymentId: paymentId,
@@ -316,7 +321,7 @@ router.post("/recurrent-charge", async (req, res) => {
       Amount: amountKop,
       CustomerKey: userId,
       OrderId: orderId,
-      Receipt: receipt,
+      Receipt: receipt, // объект можно передавать, но не в токен
       SendEmail: Boolean(sendEmail),
       ...(ip ? { IP: ip } : {}),
       ...(infoEmail ? { InfoEmail: infoEmail } : {}),
@@ -358,6 +363,9 @@ router.post("/recurrent-charge", async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
+
+
 /* ============================================================
    Webhook
    ============================================================ */
