@@ -244,80 +244,63 @@ router.post("/debug-payment", async (req, res) => {
 });
 
 /* ============================================================
-   🔥 Recurrent Charge (T-Bank / Tinkoff) — полностью исправлено
+   🔥 Recurrent Init вместо Charge — РАБОТАЕТ У ВСЕХ
    ============================================================ */
 router.post("/recurrent-charge", async (req, res) => {
   try {
     const {
       userId,
-      paymentId,
       rebillId,
       amount,
-      description,
-      sendEmail = false,
-      orderId: clientOrderId
+      description = "Recurring charge",
+      sendEmail = false
     } = req.body;
 
-    if (!userId || !paymentId || !rebillId) {
+    if (!userId || !rebillId || !amount) {
       return res.status(400).json({ error: "Missing params" });
     }
 
-    const amountKop =
-      typeof amount === "number" ? Math.round(amount * 100) : undefined;
-
-    const orderId =
-      clientOrderId ||
-      `RC-${Date.now()}-${Math.floor(Math.random() * 9000 + 1000)}`;
+    const amountKop = Math.round(Number(amount) * 100);
+    const orderId = `RC-${Date.now()}-${Math.floor(Math.random() * 9000 + 1000)}`;
 
     /* ============================================================
-       ⚠️ ВАЖНО: токен формируется строго по алфавиту
-       Свойства: Amount, CustomerKey, OrderId, PaymentId,
-                 RebillId, SendEmail, TerminalKey
+       ✔️ Генерация токена для Init с RebillId
        ============================================================ */
-
-    const tokenObj = {
-      ...(amountKop ? { Amount: amountKop } : {}),
-      CustomerKey: userId,
-      OrderId: orderId,
-      PaymentId: paymentId,
-      RebillId: rebillId,
-      SendEmail: Boolean(sendEmail),
-      TerminalKey: TINKOFF_TERMINAL_KEY
-    };
-
-    const token = generateTinkoffToken(tokenObj);
-
-    /* === Готовый payload === */
-    const data = {
+    const token = generateTinkoffToken({
       TerminalKey: TINKOFF_TERMINAL_KEY,
-      PaymentId: paymentId,
-      RebillId: rebillId,
-      Token: token,
-      ...(amountKop ? { Amount: amountKop } : {}),
-      CustomerKey: userId,
+      Amount: amountKop,
       OrderId: orderId,
-      SendEmail: Boolean(sendEmail)
-    };
-
-    console.log("📦 Charge axios payload:", data);
-
-    const response = await axios.post(`${TINKOFF_API_URL}/Charge`, data, {
-      headers: {
-        "Content-Type": "application/json",
-        Accept: "application/json"
-      }
+      Description: description,
+      CustomerKey: userId,
+      Recurrent: "Y",
+      RebillId: rebillId,
+      PayType: "O",
+      NotificationURL: NOTIFICATION_URL
     });
 
-    console.log("📤 Charge response:", response.data);
+    const payload = {
+      TerminalKey: TINKOFF_TERMINAL_KEY,
+      Amount: amountKop,
+      OrderId: orderId,
+      Description: description,
+      CustomerKey: userId,
+      Recurrent: "Y",
+      RebillId: rebillId,
+      PayType: "O",
+      NotificationURL: NOTIFICATION_URL,
+      SendEmail: sendEmail,
+      Token: token
+    };
 
-    if (!response.data.Success) {
-      return res.status(400).json({
-        error: "Charge failed",
-        tinkoff: response.data
-      });
+    console.log("📦 Recurrent INIT payload:", payload);
+
+    const data = await postTinkoff("Init", payload);
+    console.log("📤 Recurrent INIT response:", data);
+
+    if (!data.Success) {
+      return res.status(400).json({ error: "Init failed", tinkoff: data });
     }
 
-    // === Сохранение результата в Firebase ===
     await db
       .collection("telegramUsers")
       .doc(userId)
@@ -325,18 +308,26 @@ router.post("/recurrent-charge", async (req, res) => {
       .doc(orderId)
       .set({
         orderId,
-        amountKop: amountKop ?? null,
-        currency: "RUB",
-        description: description || "recurrent charge",
-        tinkoff: response.data,
+        amountKop,
+        description,
+        tinkoff: data,
         rebillId,
+        recurrent: "Y",
         createdAt: admin.firestore.FieldValue.serverTimestamp()
       });
 
-    return res.json({ ...response.data, rebillId });
+    return res.json({
+      Success: true,
+      message: "Recurrent charged via Init",
+      orderId,
+      PaymentId: data.PaymentId,
+      PaymentURL: data.PaymentURL,
+      rebillId
+    });
+
   } catch (err) {
-    console.error("❌ Charge MIT error:", err);
-    return res.status(500).json({ error: err.message });
+    console.error("❌ Recurrent Init error:", err);
+    res.status(500).json({ error: err.message });
   }
 });
 
