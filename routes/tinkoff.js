@@ -5,8 +5,6 @@ import { db } from "../firebase.js";
 import fetch from "node-fetch";
 import crypto from "crypto";
 import admin from "firebase-admin";
-import axios from "axios";
-
 
 const router = express.Router();
 
@@ -100,7 +98,6 @@ router.post("/init", async (req, res) => {
     const amountKop = Math.round(amount * 100);
     const orderId = `ORD-${Date.now()}-${Math.floor(Math.random() * 9000 + 1000)}`.slice(0, 36);
 
-        // --- Генерация токена для Init (без лишних полей типа PayType) ---
     const token = generateTinkoffToken({
       TerminalKey: TINKOFF_TERMINAL_KEY,
       Amount: amountKop,
@@ -108,7 +105,9 @@ router.post("/init", async (req, res) => {
       Description: description,
       OrderId: orderId,
       NotificationURL: NOTIFICATION_URL,
-      Recurrent: recurrent
+      Recurrent: recurrent,
+      PayType: "O",
+      Language: "ru"
     });
 
     const payload = {
@@ -118,6 +117,8 @@ router.post("/init", async (req, res) => {
       Description: description,
       CustomerKey: userId,
       Recurrent: recurrent,
+      PayType: "O",
+      Language: "ru",
       NotificationURL: NOTIFICATION_URL,
       Token: token,
       Receipt: {
@@ -128,7 +129,6 @@ router.post("/init", async (req, res) => {
         ]
       }
     };
-
 
     const data = await postTinkoff("Init", payload);
     if (!data.Success) return res.status(400).json(data);
@@ -244,61 +244,83 @@ router.post("/debug-payment", async (req, res) => {
 });
 
 /* ============================================================
-   🔥 Recurrent Init вместо Charge — РАБОТАЕТ У ВСЕХ
+   🔥 Recurrent Charge (MIT) — версия через axios как в примере
    ============================================================ */
 router.post("/recurrent-charge", async (req, res) => {
   try {
     const {
       userId,
+      paymentId,
       rebillId,
       amount,
-      description = "Recurring charge",
-      sendEmail = false
+      description,
+      orderId: clientOrderId,
+      ip,
+      sendEmail = false,
+      infoEmail = ""
     } = req.body;
 
-    if (!userId || !rebillId || !amount) {
+    if (!userId || !paymentId || !rebillId)
       return res.status(400).json({ error: "Missing params" });
-    }
 
-    const amountKop = Math.round(Number(amount) * 100);
-    const orderId = `RC-${Date.now()}-${Math.floor(Math.random() * 9000 + 1000)}`;
+    const amountKop =
+      typeof amount === "number" ? Math.round(amount * 100) : undefined;
 
-    /* ============================================================
-       ✔️ Генерация токена для Init с RebillId
-       ============================================================ */
-    const token = generateTinkoffToken({
-      TerminalKey: TINKOFF_TERMINAL_KEY,
-      Amount: amountKop,
-      OrderId: orderId,
-      Description: description,
+    const orderId =
+      clientOrderId ||
+      `RC-${Date.now()}-${Math.floor(Math.random() * 9000 + 1000)}`.slice(0, 36);
+
+    /* === Генерация токена: строго по алфавиту + Password === */
+    const tokenObj = {
+      ...(amountKop ? { Amount: amountKop } : {}),
       CustomerKey: userId,
-      Recurrent: "Y",
-      RebillId: rebillId,
-      PayType: "O",
-      NotificationURL: NOTIFICATION_URL
-    });
-
-    const payload = {
-      TerminalKey: TINKOFF_TERMINAL_KEY,
-      Amount: amountKop,
+      IP: ip,
+      InfoEmail: infoEmail,
       OrderId: orderId,
-      Description: description,
-      CustomerKey: userId,
-      Recurrent: "Y",
+      PaymentId: paymentId,
       RebillId: rebillId,
-      PayType: "O",
-      NotificationURL: NOTIFICATION_URL,
-      SendEmail: sendEmail,
-      Token: token
+      SendEmail: Boolean(sendEmail),
+      TerminalKey: TINKOFF_TERMINAL_KEY
     };
 
-    console.log("📦 Recurrent INIT payload:", payload);
+    const token = generateTinkoffToken(tokenObj);
 
-    const data = await postTinkoff("Init", payload);
-    console.log("📤 Recurrent INIT response:", data);
+    /* === Payload в стиле примера axios === */
+    let data = JSON.stringify({
+      TerminalKey: TINKOFF_TERMINAL_KEY,
+      PaymentId: paymentId,
+      RebillId: rebillId,
+      Token: token,
+      ...(amountKop ? { Amount: amountKop } : {}),
+      CustomerKey: userId,
+      OrderId: orderId,
+      ...(ip ? { IP: ip } : {}),
+      SendEmail: Boolean(sendEmail),
+      ...(infoEmail ? { InfoEmail: infoEmail } : {})
+    });
 
-    if (!data.Success) {
-      return res.status(400).json({ error: "Init failed", tinkoff: data });
+    console.log("📦 Charge axios payload:", JSON.parse(data));
+
+    let config = {
+      method: "post",
+      maxBodyLength: Infinity,
+      url: `${TINKOFF_API_URL}/Charge`,
+      headers: {
+        "Content-Type": "application/json",
+        "Accept": "application/json"
+      },
+      data: data
+    };
+
+    const response = await axios.request(config);
+
+    console.log("📤 Charge response:", response.data);
+
+    if (!response.data.Success) {
+      return res.status(400).json({
+        error: "Charge failed",
+        tinkoff: response.data
+      });
     }
 
     await db
@@ -308,25 +330,17 @@ router.post("/recurrent-charge", async (req, res) => {
       .doc(orderId)
       .set({
         orderId,
-        amountKop,
-        description,
-        tinkoff: data,
+        amountKop: amountKop ?? null,
+        currency: "RUB",
+        description: description || "recurrent charge",
+        tinkoff: response.data,
         rebillId,
-        recurrent: "Y",
         createdAt: admin.firestore.FieldValue.serverTimestamp()
       });
 
-    return res.json({
-      Success: true,
-      message: "Recurrent charged via Init",
-      orderId,
-      PaymentId: data.PaymentId,
-      PaymentURL: data.PaymentURL,
-      rebillId
-    });
-
+    res.json({ ...response.data, rebillId });
   } catch (err) {
-    console.error("❌ Recurrent Init error:", err);
+    console.error("❌ Charge MIT error:", err);
     res.status(500).json({ error: err.message });
   }
 });
