@@ -5,7 +5,7 @@ import { db } from "../firebase.js";
 import fetch from "node-fetch";
 import crypto from "crypto";
 import admin from "firebase-admin";
-import TbankPayments from "tbank-payments";
+import axios from "axios";
 
 const router = express.Router();
 
@@ -15,30 +15,34 @@ const TINKOFF_PASSWORD = "rlkzhollw74x8uvv";
 const TINKOFF_API_URL = "https://securepay.tinkoff.ru/v2";
 const NOTIFICATION_URL = "https://astro-1-nns5.onrender.com/api/webhook";
 
-// === Инициализация TbankPayments SDK
-const tbank = new TbankPayments({
-  merchantId: TINKOFF_TERMINAL_KEY,
-  secret: TINKOFF_PASSWORD,
-  apiUrl: 'https://securepay.tinkoff.ru'
-});
-
 /* ============================================================
    🔐 Универсальная генерация токена Tinkoff (Init, Charge, др.)
    Token = SHA256( values(sortedKeys) + Password )
    ============================================================ */
 function generateTinkoffToken(params) {
+  // 1. Берём только root поля и исключаем Token
   const filtered = {};
   for (const key of Object.keys(params)) {
     if (key !== "Token" && params[key] !== undefined && params[key] !== null) {
       filtered[key] = params[key];
     }
   }
+
+  // 2. Добавляем Password в корень, как требует документация
   filtered["Password"] = TINKOFF_PASSWORD;
+
+  // 3. Сортировка ключей (строго по алфавиту)
   const sortedKeys = Object.keys(filtered).sort();
+
+  // 4. Конкатенация только значений
   const concatenated = sortedKeys.map((key) => `${filtered[key]}`).join("");
+
   console.log("🔐 Token string:", concatenated);
+
+  // 5. SHA-256
   return crypto.createHash("sha256").update(concatenated, "utf8").digest("hex");
 }
+
 
 /* ============================================================
    POST wrapper
@@ -62,6 +66,7 @@ async function getTinkoffState(paymentId) {
     PaymentId: paymentId,
     Token: token
   });
+
   return resp.PaymentData?.RebillId || null;
 }
 
@@ -75,6 +80,7 @@ async function findOrderByOrderId(orderId) {
       .doc(userDoc.id)
       .collection("orders")
       .doc(orderId);
+
     const orderDoc = await orderRef.get();
     if (orderDoc.exists) return { userId: userDoc.id, orderRef, orderData: orderDoc.data() };
   }
@@ -239,66 +245,99 @@ router.post("/debug-payment", async (req, res) => {
 });
 
 /* ============================================================
-   Создание чека для recurrent-charge
-   ============================================================ */
-function createReceipt(email = 'client@example.com', amountKop = 10000, description = 'Продление подписки') {
-  return {
-    Email: email,
-    Phone: '+79001234567',
-    Taxation: 'osn',
-    Items: [
-      {
-        Name: description,
-        Price: amountKop,
-        Quantity: 1,
-        Amount: amountKop,
-        Tax: 'vat20',
-        PaymentMethod: 'full_payment',
-        PaymentObject: 'service'
-      }
-    ]
-  };
-}
-
-/* ============================================================
-   POST /recurrent-charge — повторное списание с чеком
+   🔥 Recurrent Charge (MIT) — версия через axios как в примере
    ============================================================ */
 router.post("/recurrent-charge", async (req, res) => {
   try {
-    const { userId, rebillId, amount, description = 'Повторное списание', email = 'client@example.com' } = req.body;
+    const {
+      userId,
+      paymentId,
+      rebillId,
+      amount,
+      description = "Продление подписки",
+      orderId: clientOrderId,
+      ip,
+      sendEmail = false,
+      infoEmail = "",
+      email = "client@example.com",
+      phone = "+79000000000",
+      taxation = "osn"
+    } = req.body;
 
-    if (!userId || !rebillId || !amount) {
-      return res.status(400).json({ error: "Missing userId, rebillId, or amount" });
+    if (!userId || !paymentId || !rebillId) {
+      return res.status(400).json({ error: "Missing required params" });
     }
 
-    const amountKop = Math.round(amount * 100);
-    const orderId = `RC-${Date.now()}-${Math.floor(Math.random() * 9000 + 1000)}`.slice(0, 36);
+    const amountKop = typeof amount === "number" ? Math.round(amount * 100) : 10000;
 
-    console.log(`🚀 Создаём чек для пользователя ${userId}...`);
-    const receipt = createReceipt(email, amountKop, description);
+    const orderId =
+      clientOrderId ||
+      `RC-${Date.now()}-${Math.floor(Math.random() * 9000 + 1000)}`.slice(0, 36);
 
-    console.log('📋 Инициализируем новый платеж с чеком...');
-    const newPayment = await tbank.initPayment({
+    // === Создаём чек ===
+    const receipt = {
+      Email: email,
+      Phone: phone,
+      Taxation: taxation,
+      Items: [
+        {
+          Name: description,
+          Price: amountKop,
+          Quantity: 1,
+          Amount: amountKop,
+          Tax: "vat20",
+          PaymentMethod: "full_payment",
+          PaymentObject: "service"
+        }
+      ]
+    };
+
+    // === Генерация токена строго по алфавиту + Password ===
+    const tokenObj = {
       Amount: amountKop,
+      CustomerKey: userId,
+      IP: ip,
+      InfoEmail: infoEmail || undefined,
       OrderId: orderId,
-      Description: description,
-      Receipt: receipt
+      PaymentId: paymentId,
+      RebillId: rebillId,
+      Receipt: receipt,
+      SendEmail: Boolean(sendEmail),
+      TerminalKey: TINKOFF_TERMINAL_KEY
+    };
+
+    const token = generateTinkoffToken(tokenObj);
+
+    // === Payload для Charge ===
+    const payload = {
+      TerminalKey: TINKOFF_TERMINAL_KEY,
+      PaymentId: paymentId,
+      RebillId: rebillId,
+      Amount: amountKop,
+      CustomerKey: userId,
+      OrderId: orderId,
+      Receipt: receipt,
+      SendEmail: Boolean(sendEmail),
+      ...(ip ? { IP: ip } : {}),
+      ...(infoEmail ? { InfoEmail: infoEmail } : {}),
+      Token: token
+    };
+
+    console.log("📦 Charge payload:", payload);
+
+    const response = await axios.post(`${TINKOFF_API_URL}/Charge`, payload, {
+      headers: { "Content-Type": "application/json", Accept: "application/json" }
     });
 
-    console.log(`💳 Платеж создан: PaymentId=${newPayment.PaymentId}, OrderId=${newPayment.OrderId}`);
+    console.log("📤 Charge response:", response.data);
 
-    console.log('🔄 Проводим списание по RebillId...');
-    const chargeResult = await tbank.chargeRecurrent({
-      PaymentId: newPayment.PaymentId,
-      RebillId: rebillId
-    });
+    if (!response.data.Success) {
+      return res.status(400).json({ error: "Charge failed", tinkoff: response.data });
+    }
 
-    console.log('✅ Списание выполнено:', chargeResult);
-
-    const finalStatus = await tbank.getPaymentState({ PaymentId: newPayment.PaymentId });
-
-    // Сохраняем в Firebase
-    await db.collection("telegramUsers")
+    // === Сохраняем заказ в Firebase ===
+    await db
+      .collection("telegramUsers")
       .doc(userId)
       .collection("orders")
       .doc(orderId)
@@ -307,25 +346,18 @@ router.post("/recurrent-charge", async (req, res) => {
         amountKop,
         currency: "RUB",
         description,
-        tinkoff: chargeResult,
+        tinkoff: response.data,
         rebillId,
+        receipt,
         createdAt: admin.firestore.FieldValue.serverTimestamp()
       });
 
-    res.json({
-      success: chargeResult.Success,
-      paymentId: newPayment.PaymentId,
-      orderId: newPayment.OrderId,
-      status: finalStatus.Status,
-      amount: finalStatus.Amount / 100
-    });
-
-  } catch (error) {
-    console.error("❌ Ошибка recurrent-charge:", error);
-    res.status(500).json({ error: error.message, details: error.details || null });
+    res.json({ ...response.data, rebillId, receipt });
+  } catch (err) {
+    console.error("❌ Recurrent Charge error:", err);
+    res.status(500).json({ error: err.message });
   }
 });
-
 /* ============================================================
    Webhook
    ============================================================ */
@@ -334,35 +366,40 @@ router.post("/webhook", async (req, res) => {
     const n = req.body;
     console.log("📨 Webhook:", n);
 
-    let userId = n.CustomerKey || n.customerKey;
-    let orderRef = userId ? db.collection("telegramUsers").doc(userId).collection("orders").doc(n.OrderId) : null;
-    let orderDoc = orderRef ? await orderRef.get() : null;
+    if (n.Success && n.Status === "CONFIRMED") {
+      let userId = n.CustomerKey || n.customerKey;
+      let orderRef = userId
+        ? db.collection("telegramUsers").doc(userId).collection("orders").doc(n.OrderId)
+        : null;
 
-    if (!orderDoc?.exists) {
-      const found = await findOrderByOrderId(n.OrderId);
-      if (found) {
-        userId = found.userId;
-        orderRef = found.orderRef;
+      let orderDoc = orderRef ? await orderRef.get() : null;
+
+      if (!orderDoc?.exists) {
+        const found = await findOrderByOrderId(n.OrderId);
+        if (found) {
+          userId = found.userId;
+          orderRef = found.orderRef;
+        }
       }
-    }
 
-    if (userId && orderRef) {
-      const updateData = {
-        tinkoffNotification: n,
-        notifiedAt: admin.firestore.FieldValue.serverTimestamp()
-      };
-      if (n.RebillId) updateData.rebillId = n.RebillId;
+      if (userId && orderRef) {
+        const updateData = {
+          tinkoffNotification: n,
+          notifiedAt: admin.firestore.FieldValue.serverTimestamp()
+        };
+        if (n.RebillId) updateData.rebillId = n.RebillId;
 
-      await orderRef.update(updateData);
-    } else {
-      await db.collection("unprocessedWebhooks").add({
-        orderId: n.OrderId,
-        paymentId: n.PaymentId,
-        rebillId: n.RebillId,
-        customerKey: userId,
-        notification: n,
-        receivedAt: admin.firestore.FieldValue.serverTimestamp()
-      });
+        await orderRef.update(updateData);
+      } else {
+        await db.collection("unprocessedWebhooks").add({
+          orderId: n.OrderId,
+          paymentId: n.PaymentId,
+          rebillId: n.RebillId,
+          customerKey: userId,
+          notification: n,
+          receivedAt: admin.firestore.FieldValue.serverTimestamp()
+        });
+      }
     }
 
     res.json({ Success: true });
