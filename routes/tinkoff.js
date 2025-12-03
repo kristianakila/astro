@@ -243,105 +243,112 @@ router.post("/debug-payment", async (req, res) => {
   }
 });
 
-/* ============================================================
-   🔥 Recurrent Charge (MIT) — версия через axios как в примере
-   ============================================================ */
+// ============================================
+// /recurrent-charge — повторное списание с чеком
+// ============================================
+import express from "express";
+import { db } from "../firebase.js";
+import admin from "firebase-admin";
+import TbankPayments from "tbank-payments";
+
+const router = express.Router();
+
+// === Tinkoff SDK ===
+const tbank = new TbankPayments({
+  merchantId: '1691507148627',  // TerminalKey
+  secret: 'rlkzhollw74x8uvv',   // Secret
+  apiUrl: 'https://securepay.tinkoff.ru'
+});
+
+// ============================================
+// Создание чека для платежа
+function createReceipt(email = 'client@example.com', amountKop = 10000, description = 'Продление подписки') {
+  return {
+    Email: email,
+    Phone: '+79001234567',
+    Taxation: 'osn',
+    Items: [
+      {
+        Name: description,
+        Price: amountKop,
+        Quantity: 1,
+        Amount: amountKop,
+        Tax: 'vat20',
+        PaymentMethod: 'full_payment',
+        PaymentObject: 'service'
+      }
+    ]
+  };
+}
+
+// ============================================
+// POST /recurrent-charge
 router.post("/recurrent-charge", async (req, res) => {
   try {
     const {
       userId,
-      paymentId,
       rebillId,
       amount,
-      description,
-      orderId: clientOrderId,
-      ip,
-      sendEmail = false,
-      infoEmail = ""
+      description = 'Повторное списание',
+      email = 'client@example.com'
     } = req.body;
 
-    if (!userId || !paymentId || !rebillId)
-      return res.status(400).json({ error: "Missing params" });
-
-    const amountKop =
-      typeof amount === "number" ? Math.round(amount * 100) : undefined;
-
-    const orderId =
-      clientOrderId ||
-      `RC-${Date.now()}-${Math.floor(Math.random() * 9000 + 1000)}`.slice(0, 36);
-
-    /* === Генерация токена: строго по алфавиту + Password === */
-    const tokenObj = {
-      ...(amountKop ? { Amount: amountKop } : {}),
-      CustomerKey: userId,
-      IP: ip,
-      InfoEmail: infoEmail,
-      OrderId: orderId,
-      PaymentId: paymentId,
-      RebillId: rebillId,
-      SendEmail: Boolean(sendEmail),
-      TerminalKey: TINKOFF_TERMINAL_KEY
-    };
-
-    const token = generateTinkoffToken(tokenObj);
-
-    /* === Payload в стиле примера axios === */
-    let data = JSON.stringify({
-      TerminalKey: TINKOFF_TERMINAL_KEY,
-      PaymentId: paymentId,
-      RebillId: rebillId,
-      Token: token,
-      ...(amountKop ? { Amount: amountKop } : {}),
-      CustomerKey: userId,
-      OrderId: orderId,
-      ...(ip ? { IP: ip } : {}),
-      SendEmail: Boolean(sendEmail),
-      ...(infoEmail ? { InfoEmail: infoEmail } : {})
-    });
-
-    console.log("📦 Charge axios payload:", JSON.parse(data));
-
-    let config = {
-      method: "post",
-      maxBodyLength: Infinity,
-      url: `${TINKOFF_API_URL}/Charge`,
-      headers: {
-        "Content-Type": "application/json",
-        "Accept": "application/json"
-      },
-      data: data
-    };
-
-    const response = await axios.request(config);
-
-    console.log("📤 Charge response:", response.data);
-
-    if (!response.data.Success) {
-      return res.status(400).json({
-        error: "Charge failed",
-        tinkoff: response.data
-      });
+    if (!userId || !rebillId || !amount) {
+      return res.status(400).json({ error: "Missing userId, rebillId, or amount" });
     }
 
-    await db
-      .collection("telegramUsers")
+    const amountKop = Math.round(amount * 100);
+    const orderId = `RC-${Date.now()}-${Math.floor(Math.random() * 9000 + 1000)}`.slice(0, 36);
+
+    console.log(`🚀 Создаём чек для пользователя ${userId}...`);
+    const receipt = createReceipt(email, amountKop, description);
+
+    console.log('📋 Инициализируем новый платеж с чеком...');
+    const newPayment = await tbank.initPayment({
+      Amount: amountKop,
+      OrderId: orderId,
+      Description: description,
+      Receipt: receipt
+    });
+
+    console.log(`💳 Платеж создан: PaymentId=${newPayment.PaymentId}, OrderId=${newPayment.OrderId}`);
+
+    console.log('🔄 Проводим списание по RebillId...');
+    const chargeResult = await tbank.chargeRecurrent({
+      PaymentId: newPayment.PaymentId,
+      RebillId: rebillId
+    });
+
+    console.log('✅ Списание выполнено:', chargeResult);
+
+    const finalStatus = await tbank.getPaymentState({ PaymentId: newPayment.PaymentId });
+
+    // Сохраняем в Firebase
+    await db.collection("telegramUsers")
       .doc(userId)
       .collection("orders")
       .doc(orderId)
       .set({
         orderId,
-        amountKop: amountKop ?? null,
+        amountKop,
         currency: "RUB",
-        description: description || "recurrent charge",
-        tinkoff: response.data,
+        description,
+        tinkoff: chargeResult,
         rebillId,
         createdAt: admin.firestore.FieldValue.serverTimestamp()
       });
 
-    res.json({ ...response.data, rebillId });
-  } catch (err) {
-    console.error("❌ Charge MIT error:", err);
-    res.status(500).json({ error: err.message });
+    res.json({
+      success: chargeResult.Success,
+      paymentId: newPayment.PaymentId,
+      orderId: newPayment.OrderId,
+      status: finalStatus.Status,
+      amount: finalStatus.Amount / 100
+    });
+
+  } catch (error) {
+    console.error("❌ Ошибка recurrent-charge:", error);
+    res.status(500).json({ error: error.message, details: error.details || null });
   }
 });
 
