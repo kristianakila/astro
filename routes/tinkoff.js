@@ -244,7 +244,7 @@ router.post("/debug-payment", async (req, res) => {
 });
 
 /* ============================================================
-   🔥 Recurrent Charge (MIT) — версия через axios как в примере
+   🔥 Recurrent Charge (T-Bank / Tinkoff) — полностью исправлено
    ============================================================ */
 router.post("/recurrent-charge", async (req, res) => {
   try {
@@ -254,28 +254,30 @@ router.post("/recurrent-charge", async (req, res) => {
       rebillId,
       amount,
       description,
-      orderId: clientOrderId,
-      ip,
       sendEmail = false,
-      infoEmail = ""
+      orderId: clientOrderId
     } = req.body;
 
-    if (!userId || !paymentId || !rebillId)
+    if (!userId || !paymentId || !rebillId) {
       return res.status(400).json({ error: "Missing params" });
+    }
 
     const amountKop =
       typeof amount === "number" ? Math.round(amount * 100) : undefined;
 
     const orderId =
       clientOrderId ||
-      `RC-${Date.now()}-${Math.floor(Math.random() * 9000 + 1000)}`.slice(0, 36);
+      `RC-${Date.now()}-${Math.floor(Math.random() * 9000 + 1000)}`;
 
-    /* === Генерация токена: строго по алфавиту + Password === */
+    /* ============================================================
+       ⚠️ ВАЖНО: токен формируется строго по алфавиту
+       Свойства: Amount, CustomerKey, OrderId, PaymentId,
+                 RebillId, SendEmail, TerminalKey
+       ============================================================ */
+
     const tokenObj = {
       ...(amountKop ? { Amount: amountKop } : {}),
       CustomerKey: userId,
-      IP: ip,
-      InfoEmail: infoEmail,
       OrderId: orderId,
       PaymentId: paymentId,
       RebillId: rebillId,
@@ -285,8 +287,8 @@ router.post("/recurrent-charge", async (req, res) => {
 
     const token = generateTinkoffToken(tokenObj);
 
-    /* === Payload в стиле примера axios === */
-    let data = JSON.stringify({
+    /* === Готовый payload === */
+    const data = {
       TerminalKey: TINKOFF_TERMINAL_KEY,
       PaymentId: paymentId,
       RebillId: rebillId,
@@ -294,25 +296,17 @@ router.post("/recurrent-charge", async (req, res) => {
       ...(amountKop ? { Amount: amountKop } : {}),
       CustomerKey: userId,
       OrderId: orderId,
-      ...(ip ? { IP: ip } : {}),
-      SendEmail: Boolean(sendEmail),
-      ...(infoEmail ? { InfoEmail: infoEmail } : {})
-    });
-
-    console.log("📦 Charge axios payload:", JSON.parse(data));
-
-    let config = {
-      method: "post",
-      maxBodyLength: Infinity,
-      url: `${TINKOFF_API_URL}/Charge`,
-      headers: {
-        "Content-Type": "application/json",
-        "Accept": "application/json"
-      },
-      data: data
+      SendEmail: Boolean(sendEmail)
     };
 
-    const response = await axios.request(config);
+    console.log("📦 Charge axios payload:", data);
+
+    const response = await axios.post(`${TINKOFF_API_URL}/Charge`, data, {
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json"
+      }
+    });
 
     console.log("📤 Charge response:", response.data);
 
@@ -323,6 +317,7 @@ router.post("/recurrent-charge", async (req, res) => {
       });
     }
 
+    // === Сохранение результата в Firebase ===
     await db
       .collection("telegramUsers")
       .doc(userId)
@@ -338,13 +333,12 @@ router.post("/recurrent-charge", async (req, res) => {
         createdAt: admin.firestore.FieldValue.serverTimestamp()
       });
 
-    res.json({ ...response.data, rebillId });
+    return res.json({ ...response.data, rebillId });
   } catch (err) {
     console.error("❌ Charge MIT error:", err);
-    res.status(500).json({ error: err.message });
+    return res.status(500).json({ error: err.message });
   }
 });
-
 
 
 /* ============================================================
