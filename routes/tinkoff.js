@@ -246,19 +246,6 @@ router.post("/debug-payment", async (req, res) => {
 // ============================================
 // /recurrent-charge — повторное списание с чеком
 // ============================================
-import express from "express";
-import { db } from "../firebase.js";
-import admin from "firebase-admin";
-import TbankPayments from "tbank-payments";
-
-const router = express.Router();
-
-// === Tinkoff SDK ===
-const tbank = new TbankPayments({
-  merchantId: '1691507148627',  // TerminalKey
-  secret: 'rlkzhollw74x8uvv',   // Secret
-  apiUrl: 'https://securepay.tinkoff.ru'
-});
 
 // ============================================
 // Создание чека для платежа
